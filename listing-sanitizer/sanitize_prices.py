@@ -1,39 +1,24 @@
-import os
-import json
 import re
-
-
-# Directory to sanitize
-dir_to_sanitize = os.path.join(os.path.dirname(__file__), '..', 'listings-sanitized')
-os.makedirs(dir_to_sanitize, exist_ok=True)
+from utils import get_sanitized_directory, process_json_files
 
 def extract_price(price_str):
-    """
-    Extracts the per night price as a float from a string like '2 nights x $30.50\n$61.00'.
-    Returns None if not found.
-    """
-    match = re.search(r'\$([0-9]+\.?[0-9]*)', price_str)
+    """Extract per night price from strings like '2 nights x $30.50\n$61.00'."""
+    match = re.search(r'\$(\d+\.?\d*)', price_str)
     if match:
         return float(match.group(1))
     try:
         return float(price_str)
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
-def sanitize_listings():
-    for filename in os.listdir(dir_to_sanitize):
-        file_path = os.path.join(dir_to_sanitize, filename)
-        if os.path.isfile(file_path):
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            # Sanitize price
-            if 'price' in data:
-                price_val = extract_price(str(data['price']))
-                if price_val is not None:
-                    data['price'] = price_val
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+def process_price(data, filename):
+    """Process price field in listing data."""
+    if 'price' in data:
+        price_val = extract_price(str(data['price']))
+        if price_val is not None:
+            data['price'] = price_val
+    return data
 
 if __name__ == "__main__":
-    sanitize_listings()
-    print(f"Sanitized all prices in files in {dir_to_sanitize}")
+    dir_to_sanitize = get_sanitized_directory()
+    process_json_files(dir_to_sanitize, process_price, "Price sanitization")

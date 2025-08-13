@@ -1,8 +1,14 @@
 import os
 import json
+from utils import get_sanitized_directory
 
-# Directory to validate
-dir_to_validate = os.path.join(os.path.dirname(__file__), '..', 'listings-sanitized')
+# Required fields for the project
+REQUIRED_FIELDS = [
+    'id', 'title', 'listing_type', 'room_type', 'price', 'max_guests',
+    'bedrooms', 'beds', 'baths', 'rating_overall', 'rating_cleanliness',
+    'rating_accuracy', 'rating_checkin', 'rating_communication',
+    'rating_location', 'rating_value', 'reviews', 'url', 'location'
+]
 
 def check_field_value(data, field, listing_id, filename):
     """Check if a specific field has a valid value."""
@@ -76,48 +82,26 @@ def generate_report(null_field_entries, required_fields):
 def validate_required_fields():
     """Check for null values in required fields and generate a report."""
     
-    # Define the required fields based on the final structure
-    required_fields = [
-        'id',
-        'title', 
-        'listing_type',
-        'room_type',
-        'price',
-        'max_guests',
-        'bedrooms',
-        'beds',
-        'baths',
-        'rating_overall',
-        'rating_cleanliness',
-        'rating_accuracy',
-        'rating_checkin',
-        'rating_communication',
-        'rating_location',
-        'rating_value',
-        'reviews',
-        'url',
-        'location'
-    ]
-    
     # Dictionary to store null field entries
-    null_field_entries = {field: [] for field in required_fields}
+    null_field_entries = {field: [] for field in REQUIRED_FIELDS}
     
     # Process each JSON file
+    dir_to_validate = get_sanitized_directory()
     for filename in os.listdir(dir_to_validate):
         if not filename.endswith('.json'):
             continue
             
         file_path = os.path.join(dir_to_validate, filename)
-        process_json_file(file_path, filename, required_fields, null_field_entries)
+        process_json_file(file_path, filename, REQUIRED_FIELDS, null_field_entries)
     
     # Generate the validation report
-    total_missing = generate_report(null_field_entries, required_fields)
+    total_missing = generate_report(null_field_entries, REQUIRED_FIELDS)
     
     print("Validation report generated: missing_fields_report.txt")
     print(f"Total missing field instances found: {total_missing}")
     
     # Print summary to console
-    for field in required_fields:
+    for field in REQUIRED_FIELDS:
         missing_count = len(null_field_entries[field])
         if missing_count > 0:
             print(f"  - {field}: {missing_count} missing")
