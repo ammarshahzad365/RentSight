@@ -1,2 +1,7 @@
 data/
-.json
+*.json
+listings/
+listings-sanitized/
+__pycache__/
+listings-sanitized.zip
+*.txt
