@@ -6,8 +6,14 @@ def copy_listings():
     source_dir = os.path.join(os.path.dirname(__file__), '..', 'listings')
     dest_dir = os.path.join(os.path.dirname(__file__), '..', 'listings-sanitized')
     
-    # Create destination directory if it doesn't exist
-    os.makedirs(dest_dir, exist_ok=True)
+    # Clean destination directory (remove all existing files)
+    if os.path.exists(dest_dir):
+        for filename in os.listdir(dest_dir):
+            file_path = os.path.join(dest_dir, filename)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+    else:
+        os.makedirs(dest_dir, exist_ok=True)
     
     # Copy all files from source to destination
     copied_count = 0

@@ -19,6 +19,7 @@ def main():
     pipeline_steps = [
         ('copy_listings.py', 'Copying listings'),
         ('sanitize_prices.py', 'Sanitizing prices'),
+        ('sanitize_ratings.py', 'Sanitizing ratings'),
         ('sanitize_reviews.py', 'Sanitizing reviews'),
         ('sanitize_url.py', 'Sanitizing URLs'),
         ('sanitize_location.py', 'Sanitizing location data'),
