@@ -5,25 +5,23 @@ from utils import get_sanitized_directory
 # Required fields for the project
 REQUIRED_FIELDS = [
     'id', 'title', 'listing_type', 'room_type', 'price', 'max_guests',
-    'bedrooms', 'beds', 'baths', 'rating_overall', 'rating_cleanliness',
-    'rating_accuracy', 'rating_checkin', 'rating_communication',
-    'rating_location', 'rating_value', 'reviews', 'url', 'location'
+    'bedrooms', 'beds', 'baths', 'url', 'location'
 ]
 
 def check_field_value(data, field, listing_id, filename):
     """Check if a specific field has a valid value."""
     if field not in data or data[field] is None:
-        return f"{listing_id} - {filename}"
+        return f"{data.get('url', 'No URL')} ({filename})"
     
     if field == 'location' and isinstance(data[field], dict):
         # Special check for location - ensure it has lat and lng
         if 'lat' not in data[field] or 'lng' not in data[field] or \
            data[field]['lat'] is None or data[field]['lng'] is None:
-            return f"{listing_id} - {filename}"
+            return f"{data.get('url', 'No URL')} ({filename})"
     elif field == 'reviews' and isinstance(data[field], list):
         # Check if reviews array is empty
         if len(data[field]) == 0:
-            return f"{listing_id} - {filename}"
+            return f"{data.get('url', 'No URL')} ({filename})"
     
     return None
 
@@ -65,7 +63,7 @@ def generate_report(null_field_entries, required_fields):
             f.write(f"Missing in {missing_count} listings\n")
             
             if missing_count > 0:
-                f.write("Affected listings (ID - Filename):\n")
+                f.write("Affected listings (URL - Filename):\n")
                 for entry in null_field_entries[field]:
                     f.write(f"  - {entry}\n")
             else:
