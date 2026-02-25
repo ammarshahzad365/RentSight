@@ -37,7 +37,7 @@ import time
 import re
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Callable
 from datetime import datetime
 
 from selenium import webdriver
@@ -47,10 +47,16 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
+
+from islamabad_sectors import islamabad_sectors
 
 # Global set of listing IDs already scraped (loaded once at import)
 EXISTING_LISTING_IDS: set[str] = set()
+
+# Retry window (seconds) before giving up on a failed page or coords run
+RETRY_WINDOW_SECONDS = 5 * 60
 
 def _init_existing_ids(directory: str = "listings") -> None:
     """Populate EXISTING_LISTING_IDS from filenames in listings directory.
@@ -105,6 +111,7 @@ class Listing:
     checkin_date: str = None  # Check-in date in YYYY-MM-DD format
     checkout_date: str = None  # Check-out date in YYYY-MM-DD format
     search_date: str = None  # Date when this listing was scraped
+    search_coords: Optional[str] = None  # Coords string used for the map search that found this listing
     # Google Maps derived data (added via injected hook script)
     map_init_center: Optional[dict] = None      # {lat: float, lng: float}
     map_idle_center: Optional[dict] = None      # {lat: float, lng: float}
@@ -123,7 +130,9 @@ def extract_listing_id(url: str) -> str:
         return url
 
 
-def parse_listing_details(driver: webdriver.Chrome, checkin: str, checkout: str) -> Optional[Listing]:
+def parse_listing_details(
+    driver: webdriver.Chrome, checkin: str, checkout: str, search_coords: Optional[str] = None
+) -> Optional[Listing]:
     """
     Given a WebDriver instance and the URL of a listing, this function
     assumes the listing page is already loaded in the current tab, waits 
@@ -139,6 +148,13 @@ def parse_listing_details(driver: webdriver.Chrome, checkin: str, checkout: str)
             EC.presence_of_element_located((By.TAG_NAME, "h1"))
         )
         title = title_el.text.strip()
+        time.sleep(5)
+        try: 
+            close_el = driver.find_element(By.CSS_SELECTOR, 'button[aria-label=Close]')
+            if close_el:
+                close_el.click()
+        except Exception:
+            print("No initial close button found or clickable.")
 
         # Initialize containers that may be populated later
         amenities: Optional[Dict[str, List[str]]] = None
@@ -335,109 +351,123 @@ def parse_listing_details(driver: webdriver.Chrome, checkin: str, checkout: str)
 
             except Exception:
                 return None
-            
-        # Wait for the <a> element whose href contains both 'rooms' and 'review'
-        link = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, 'rooms') and contains(@href, 'review')]"))
-        )
 
-        # Click the element
-        link.click()
+        # Defaults when listing has no reviews
+        rating_overall = rating_cleanliness = rating_accuracy = rating_checkin = None
+        rating_communication = rating_location = rating_value = None
+        reviews = []
 
-        rating_overall = get_rating("(//h1[@elementtiming='LCP-target'])[2]", By.XPATH)
-        rating_cleanliness = get_rating(
-            "//*[contains(., 'out of 5 stars for cleanliness')]",
-            By.XPATH
-        )
-        rating_accuracy = get_rating(
-            "//*[contains(., 'out of 5 stars for accuracy')]",
-            By.XPATH
-        )
-        rating_checkin = get_rating(
-            "//*[contains(., 'out of 5 stars for check-in')]",
-            By.XPATH
-        )
-        rating_communication = get_rating(
-            "//*[contains(., 'out of 5 stars for communication')]",
-            By.XPATH
-        )
-        rating_location = get_rating(
-            "//*[contains(., 'out of 5 stars for location')]",
-            By.XPATH
-        )
-        rating_value = get_rating(
-            "//*[contains(., 'out of 5 stars for value')]",
-            By.XPATH
-        )
+        try:
+            # Wait for the <a> element whose href contains both 'rooms' and 'review'
+            link = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, 'rooms') and contains(@href, 'review')]"))
+            )
 
-        def scroll_until_all_reviews_loaded(wait_time: float = 5.0, timeout: int = 30):
-            try:
-                # Locate the scrollable review panel
-                panel = WebDriverWait(driver, timeout).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="pdp-reviews-modal-scrollable-panel"]'))
-                )
+            # Click the element
+            link.click()
 
-                prev_count = -1
+            time.sleep(2)  # Allow time for modal to open
+            rating_overall = get_rating("(//*[contains(text(), 'out of 5 from ')])[last()]", By.XPATH)
+            rating_cleanliness = get_rating(
+                "//*[contains(., 'out of 5 stars for cleanliness')]",
+                By.XPATH
+            )
+            rating_accuracy = get_rating(
+                "//*[contains(., 'out of 5 stars for accuracy')]",
+                By.XPATH
+            )
+            rating_checkin = get_rating(
+                "//*[contains(., 'out of 5 stars for check-in')]",
+                By.XPATH
+            )
+            rating_communication = get_rating(
+                "//*[contains(., 'out of 5 stars for communication')]",
+                By.XPATH
+            )
+            rating_location = get_rating(
+                "//*[contains(., 'out of 5 stars for location')]",
+                By.XPATH
+            )
+            rating_value = get_rating(
+                "//*[contains(., 'out of 5 stars for value')]",
+                By.XPATH
+            )
 
-                while True:
-                    # Get current children (reviews)
-                    children = panel.find_elements(By.XPATH, "./*")
-                    current_count = len(children)
-
-                    # If count didn't change from last iteration, assume we're done
-                    if current_count == prev_count:
-                        print(f"Loaded {current_count} reviews.")
-                        break
-
-                    # Scroll the last child into view
-                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'end'});", children[-1])
-
-                    # Wait for lazy loading to fetch more reviews
-                    time.sleep(wait_time)
-
-                    # Update count
-                    prev_count = current_count
-
-            except Exception as e:
-                print(f"Error during review loading: {e}")
-
-        def extract_reviews() -> List[Review]:
-            reviews = []
-
-            # Find all review divs
-            review_elements = driver.find_elements(By.CSS_SELECTOR, 'div[data-review-id]')
-
-            for element in review_elements:
+            def scroll_until_all_reviews_loaded(wait_time: float = 5.0, timeout: int = 30):
                 try:
-                    review_id = element.get_attribute('data-review-id')
-                    children = element.find_elements(By.XPATH, "./div")
+                    # Locate the scrollable review panel
+                    panel = WebDriverWait(driver, timeout).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, '[data-testid="pdp-reviews-modal-scrollable-panel"]'))
+                    )
 
-                    if len(children) >= 2:
-                        metadata = children[0].text.strip()
-                        text = children[1].text.strip()
-                        reviews.append(Review(review_id, metadata, text))
+                    prev_count = -1
+
+                    while True:
+                        # Get current children (reviews)
+                        children = panel.find_elements(By.XPATH, "./*")
+                        current_count = len(children)
+
+                        # If count didn't change from last iteration, assume we're done
+                        if current_count == prev_count:
+                            print(f"Loaded {current_count} reviews.")
+                            break
+
+                        # Scroll the last child into view
+                        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'end'});", children[-1])
+
+                        # Wait for lazy loading to fetch more reviews
+                        time.sleep(wait_time)
+
+                        # Update count
+                        prev_count = current_count
+
                 except Exception as e:
-                    print(f"Error processing review: {e}")
+                    print(f"Error during review loading: {e}")
 
-            return reviews
-        scroll_until_all_reviews_loaded()
-        reviews = extract_reviews()
-        
-        close_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[aria-label="Close"]'))
-        )
-        close_button.click()
+            def extract_reviews() -> List[Review]:
+                reviews_inner = []
+
+                # Find all review divs
+                review_elements = driver.find_elements(By.CSS_SELECTOR, 'div[data-review-id]')
+
+                for element in review_elements:
+                    try:
+                        review_id = element.get_attribute('data-review-id')
+                        children = element.find_elements(By.XPATH, "./div")
+
+                        if len(children) >= 2:
+                            metadata = children[0].text.strip()
+                            text = children[1].text.strip()
+                            reviews_inner.append(Review(review_id, metadata, text))
+                    except Exception as e:
+                        print(f"Error processing review: {e}")
+
+                return reviews_inner
+            scroll_until_all_reviews_loaded()
+            reviews = extract_reviews()
+
+            close_button = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[aria-label="Close"]'))
+            )
+            close_button.click()
+        except Exception:
+            print("No reviews link (or modal failed) — keep defaults: ratings None, reviews []")
+            pass
+
         # Extract basic info (capacity, bedrooms, beds, baths)
         # Wait for the info items to be present before extracting them
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-section-id='OVERVIEW_DEFAULT_V2'] div[data-pageslot='true'] ol li"))
         )
+        time.sleep(1)
         info_items = driver.find_elements(By.CSS_SELECTOR, "div[data-section-id='OVERVIEW_DEFAULT_V2'] div[data-pageslot='true'] ol li")
         max_guests = bedrooms = beds = baths = None
         
         def extract_first_number(text):
             """Extract the first number found in the text"""
             import re
+            if 'dedicated' in text.lower():
+                return 1
             numbers = re.findall(r'\d+(?:\.\d+)?', text)
             if numbers:
                 try:
@@ -456,11 +486,16 @@ def parse_listing_details(driver: webdriver.Chrome, checkin: str, checkout: str)
                 beds = extract_first_number(text)
             elif "bath" in text:
                 baths = extract_first_number(text)
-
+        if not max_guests:
+            max_guests_text_container = driver.find_elements(By.XPATH, "//div[contains(., 'guests maximum')]")[-1]
+            if "guest" in max_guests_text_container.text.lower().split("\n")[-1] and max_guests_text_container.text.lower().endswith("maximum"):
+                max_guests = extract_first_number(max_guests_text_container.text.lower().split("\n")[-1])
+    
         # Find all "Show price breakdown" elements and click the last one
         break_down_elements = WebDriverWait(driver, 10).until(
             EC.presence_of_all_elements_located((By.XPATH, "//button[contains(., 'Show price breakdown')]"))
         )
+        time.sleep(2)
         try:    
             # Click the last element in the list
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", break_down_elements[-1])
@@ -477,6 +512,7 @@ def parse_listing_details(driver: webdriver.Chrome, checkin: str, checkout: str)
             print("No price breakdown button found or clickable. [-1]")
             return None
         
+        time.sleep(2)  # Allow time for modal to open
         try:
             # Wait for the parent div to be present
             price_container = WebDriverWait(driver, 10).until(
@@ -531,11 +567,12 @@ def parse_listing_details(driver: webdriver.Chrome, checkin: str, checkout: str)
 
         try:
             WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, 'button[aria-label="Close"]'))
+                EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[aria-label="Close"]'))
             ).click()
         except Exception as e:
             print(f"No price breakdown close button available or close button not found. Error: {e}")
 
+        time.sleep(1)  # Allow time for modal to close
         # Listing and room type: may appear near the booking summary as "Entire home",
         # "Private room", etc.  We'll read the first list item in that section.
         try:
@@ -579,6 +616,7 @@ def parse_listing_details(driver: webdriver.Chrome, checkin: str, checkout: str)
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, 'div[aria-label="What this place offers"]'))
             )
+            time.sleep(2)  # Allow time for modal to open if it did
             amenities = driver.execute_script("""
                 try {
                 const result = {};
@@ -625,12 +663,12 @@ def parse_listing_details(driver: webdriver.Chrome, checkin: str, checkout: str)
             map_section = None
             xpath_candidates = [
                 # Handle curly apostrophe ’ (U+2019)
-                "(//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'where you’') and contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'll be')])[1]",
+                "(//h2[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'where you’') and contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'll be')])[1]",
                 # Straight apostrophe version
-                "(//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'where you\\'ll be')])[1]",
+                "(//h2[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'where you\\'ll be')])[1]",
                 # Fallback broader contains logic (mixed apostrophes)
                 # Mixed apostrophes fallback (use concat to include single quote inside single-quoted XPath literal)
-                "(//*[contains(., 'Where you') and (contains(., '’ll be') or contains(., concat(\"'\", 'll be')))])",
+                "(//h2[contains(., 'Where you') and (contains(., '’ll be') or contains(., concat(\"'\", 'll be')))])",
             ]
             for xp in xpath_candidates:
                 try:
@@ -641,7 +679,10 @@ def parse_listing_details(driver: webdriver.Chrome, checkin: str, checkout: str)
                 except Exception:
                     continue
             if map_section:
-                driver.execute_script("arguments[0].scrollIntoView({behavior:'smooth', block:'center'});", map_section)
+                driver.execute_script("""
+                    arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});
+                    // window.scrollBy(0, 800);  // scroll 200px more down
+                """, map_section)
                 time.sleep(5)  # Allow map & idle event to fire
             else:
                 print("Map section element not found via provided XPaths.")
@@ -684,13 +725,14 @@ def parse_listing_details(driver: webdriver.Chrome, checkin: str, checkout: str)
             checkin_date=checkin,
             checkout_date=checkout,
             search_date=search_date,
+            search_coords=search_coords,
             map_init_center=map_init_center,
             map_idle_center=map_idle_center,
             map_idle_bounds=map_idle_bounds,
         )
     except Exception as e:
         print(f"Error parsing listing details for {driver.current_url}.  This may be due to a change in the page structure or missing elements. {e}")
-        # If any critical element cannot be found, skip this listing
+        _append_failed_listing_url(driver.current_url)
         return None
 
 
@@ -715,7 +757,16 @@ def load_existing_listing_index(directory: str = "listings") -> dict:
     return index
 
 
-def scrape_islamabad_listings(checkin: str, checkout: str, max_pages: int = 3) -> List[Listing]:
+def scrape_islamabad_listings(
+    checkin: str,
+    checkout: str,
+    max_pages: int = 3,
+    start_page: int = 1,
+    skip_pages: Optional[List[int]] = None,
+    coords: str = "",
+    coords_index: Optional[int] = None,
+    on_page_done: Optional[Callable[[int, str, int], None]] = None,
+) -> List[Listing]:
     """
     Navigate through Airbnb search results for Islamabad and collect data
     for listings appearing in the specified number of result pages.  The
@@ -728,7 +779,8 @@ def scrape_islamabad_listings(checkin: str, checkout: str, max_pages: int = 3) -
     # Build search URL (1 guest by default to keep results broad)
     search_url = (
         f"https://www.airbnb.com/s/Islamabad--Pakistan/homes?checkin={checkin}"
-        f"&checkout={checkout}&adults=1&category_tag=Tag:8116"
+        f"&checkout={checkout}&adults=1&zoom=15.5327873717292&search_by_map=true"
+        f"&{coords}"
     )
 
     # Initialize WebDriver (Chrome is used here; adjust if using another browser)
@@ -738,13 +790,21 @@ def scrape_islamabad_listings(checkin: str, checkout: str, max_pages: int = 3) -
     from selenium.webdriver.chrome.options import Options
     chrome_options = Options()
     chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument('--headless=new') 
     chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")  # IMPORTANT
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--window-position=-2000,0")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument(
+    "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
+    driver.minimize_window()
     
     # Execute script to hide automation indicators
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
@@ -779,118 +839,157 @@ def scrape_islamabad_listings(checkin: str, checkout: str, max_pages: int = 3) -
         except Exception:
             print("'Got it' button not found or not clickable within 15 seconds, continuing...")
 
+        # Start from the requested page (default 1).  If start_page > 1,
+        # advance the pagination by clicking "Next" until we reach it
         current_page = 1
+        if start_page and start_page > 1:
+            print(f"Advancing to start page {start_page}...")
+            for _ in range(start_page - 1):
+                try:
+                    print("Looking for 'Got it' button...")
+                    try:
+                        element = WebDriverWait(driver, 15).until(
+                            EC.element_to_be_clickable((By.XPATH, "//*[text()='Got it']"))
+                        )
+                        element.click()
+                        print("Clicked 'Got it' button")
+                    except Exception:
+                        print("'Got it' button not found or not clickable within 15 seconds, continuing...")
+                    next_btn = WebDriverWait(driver, 10).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "a[aria-label='Next']"))
+                    )
+                    next_btn.click()
+                    current_page += 1
+                    if on_page_done is not None and coords_index is not None:
+                        on_page_done(coords_index, coords, current_page)
+                    time.sleep(5)
+                except Exception:
+                    print(f"Unable to advance to page {_ + 2}; stopping advance loop.")
+                    break
+
+        # Normalize skip_pages to a set for fast membership tests
+        skip_pages_set = set(skip_pages or [])
 
         while current_page <= max_pages:
-            # Find all listing cards on the page
-            # cards = driver.find_elements(By.XPATH, "//a[starts-with(@href, '/rooms/')]")
-            cards = driver.find_elements(By.CSS_SELECTOR, "div[data-testid='listing-card-title']")
-
-            # Store the current window handle (search results page)
-            main_window = driver.current_window_handle
-            
-            for i, card in enumerate(cards):
+            deadline = time.monotonic() + RETRY_WINDOW_SECONDS
+            page_finished = False
+            no_more_pages = False
+            while not page_finished and not no_more_pages and time.monotonic() < deadline:
                 try:
-                    # href = card.get_attribute("href")
-                    # if not href or not href.startswith("https://www.airbnb.com/rooms/"):
-                    #     continue
-                        
-                    # link = href.split("?")[0]
-                    
-                    # # Skip if already collected in this session
-                    # if any(l.url == link for l in collected):
-                    #     continue
-                    
-                    # # Skip if already exists in our database
-                    # if link in existing_urls:
-                    #     print(f"Skipping existing listing: {link}")
-                    #     continue
-
-                    # Re-find the card element to avoid stale element reference
-                    try:
-                        current_cards = driver.find_elements(By.CSS_SELECTOR, "div[data-testid='listing-card-title']")
-                        if i < len(current_cards):
-                            current_card = current_cards[i]
-                        else:
-                            continue
-                    except Exception:
-                        continue
-                    
-                    # Click the card to open it in a new tab
-                    try:
-                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", current_card)
-                        # Get the element's location and size                        
-                        size = current_card.size
-                        center_x = size['width'] // 2
-                        center_y = size['height'] // 2
-
-                        # Move to element with offset and click
-                        ActionChains(driver).move_to_element_with_offset(current_card, center_x, center_y).click().perform()
-                        # Reset mouse offset back to avoid problems in future interactions
-                        ActionChains(driver).move_by_offset(-center_x, -center_y).perform()
-                        time.sleep(2)  # Wait for new tab to open
-                        
-                        # Switch to the new tab
-                        all_windows = driver.window_handles
-                        new_window = None
-                        for window in all_windows:
-                            if window != main_window:
-                                new_window = window
-                                break
-                        
-                        if new_window:
-                            driver.switch_to.window(new_window)
-                            
-                            # Parse the listing details from the current tab
-                            listing_data = parse_listing_details(driver, checkin, checkout)
-                            if listing_data:
-                                # Double-check by ID as well
-                                # Skip if already have this listing_id for this scrape date
-                                scrape_date = listing_data.search_date
-                                existing_dates = listing_index.get(listing_data.id, set())
-                                if scrape_date in existing_dates:
-                                    print(f"Already have {listing_data.id} for {scrape_date}, skipping save.")
-                                else:
-                                    collected.append(listing_data)
-                                    listing_index.setdefault(listing_data.id, set()).add(scrape_date)
-                                    # Persist immediately per requirement
-                                    out_dir = Path("listings")
-                                    out_dir.mkdir(parents=True, exist_ok=True)
-                                    filename = out_dir / f"{listing_data.id}_{scrape_date}.json"
-                                    try:
-                                        with open(filename, "w", encoding="utf-8") as f:
-                                            json.dump(asdict(listing_data), f, ensure_ascii=False, indent=2)
-                                        print(f"Saved listing to {filename}")
-                                        EXISTING_LISTING_IDS.add(listing_data.id)
-                                    except Exception as e:
-                                        print(f"Failed to save listing {listing_data.id}: {e}")
-                            
-                            # Close the listing tab and return to main window
-                            driver.close()
-                            driver.switch_to.window(main_window)
-                            time.sleep(1)  # Brief pause before processing next listing
-                        
-                    except Exception as e:
-                        print(f"Error processing listing {driver.current_url}, {card.text}: {e}")
-                        # Make sure we're back on the main window
+                    # If this page is requested to be skipped, jump to the next page
+                    if current_page in skip_pages_set:
+                        print(f"Skipping page {current_page} per skip_pages parameter")
+                        print("Looking for 'Got it' button...")
                         try:
-                            driver.switch_to.window(main_window)
-                        except:
-                            pass
-                        continue
-                        
-                except Exception as e:
-                    print(f"Error with card {i}: {e}")
-                    continue
+                            element = WebDriverWait(driver, 15).until(
+                                EC.element_to_be_clickable((By.XPATH, "//*[text()='Got it']"))
+                            )
+                            element.click()
+                            print("Clicked 'Got it' button")
+                        except Exception:
+                            print("'Got it' button not found or not clickable within 15 seconds, continuing...")
+                        next_btn = WebDriverWait(driver, 15).until(
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, "a[aria-label='Next']"))
+                        )
+                        next_btn.click()
+                        current_page += 1
+                        if on_page_done is not None and coords_index is not None:
+                            on_page_done(coords_index, coords, current_page)
+                        time.sleep(5)
+                        page_finished = True
+                        break
+                    # Find all listing cards on the page
+                    # cards = driver.find_elements(By.XPATH, "//a[starts-with(@href, '/rooms/')]")
+                    cards = driver.find_elements(By.CSS_SELECTOR, "div[data-testid='listing-card-title']")
 
-            # Try to navigate to the next page by clicking the Next button.  If no
-            # next button is available, break the loop.
-            try:
-                next_btn = driver.find_element(By.CSS_SELECTOR, "a[aria-label='Next']")
-                next_btn.click()
-                current_page += 1
-                time.sleep(5)
-            except Exception:
+                    # Store the current window handle (search results page)
+                    main_window = driver.current_window_handle
+
+                    for i, card in enumerate(cards):
+                        try:
+                            # Re-find the card element to avoid stale element reference
+                            try:
+                                current_cards = driver.find_elements(By.CSS_SELECTOR, "div[data-testid='listing-card-title']")
+                                if i < len(current_cards):
+                                    current_card = current_cards[i]
+                                else:
+                                    continue
+                            except Exception:
+                                continue
+
+                            # Click the card to open it in a new tab
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", current_card)
+                            size = current_card.size
+                            center_x = size['width'] // 2
+                            center_y = size['height'] // 2
+                            ActionChains(driver).move_to_element_with_offset(current_card, center_x, center_y).click().perform()
+                            ActionChains(driver).move_by_offset(-center_x, -center_y).perform()
+                            time.sleep(2)
+                            all_windows = driver.window_handles
+                            new_window = None
+                            for window in all_windows:
+                                if window != main_window:
+                                    new_window = window
+                                    break
+                            if new_window:
+                                driver.switch_to.window(new_window)
+                                listing_data = parse_listing_details(
+                                    driver, checkin, checkout, search_coords=coords
+                                )
+                                if listing_data:
+                                    scrape_date = listing_data.search_date
+                                    existing_dates = listing_index.get(listing_data.id, set())
+                                    if scrape_date in existing_dates:
+                                        print(f"Already have {listing_data.id} for {scrape_date}, skipping save.")
+                                    else:
+                                        collected.append(listing_data)
+                                        listing_index.setdefault(listing_data.id, set()).add(scrape_date)
+                                        out_dir = Path("listings")
+                                        out_dir.mkdir(parents=True, exist_ok=True)
+                                        filename = out_dir / f"{listing_data.id}_{scrape_date}.json"
+                                        try:
+                                            with open(filename, "w", encoding="utf-8") as f:
+                                                json.dump(asdict(listing_data), f, ensure_ascii=False, indent=2)
+                                            saved_count = len(list(out_dir.glob("*.json")))
+                                            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                            print(f"Saved listing to {filename} (total saved: {saved_count}) [{now}]")
+                                            EXISTING_LISTING_IDS.add(listing_data.id)
+                                        except Exception as e:
+                                            print(f"Failed to save listing {listing_data.id}: {e}")
+                                driver.close()
+                                driver.switch_to.window(main_window)
+                                time.sleep(1)
+                        except Exception as e:
+                            print(f"Error processing listing {driver.current_url}, {card.text}: {e}")
+                            try:
+                                driver.switch_to.window(main_window)
+                            except Exception:
+                                pass
+                            continue
+
+                    # Try to navigate to the next page by clicking the Next button.
+                    try:
+                        next_btn = driver.find_element(By.CSS_SELECTOR, "a[aria-label='Next']")
+                        next_btn.click()
+                        current_page += 1
+                        if on_page_done is not None and coords_index is not None:
+                            on_page_done(coords_index, coords, current_page)
+                        time.sleep(5)
+                        page_finished = True
+                    except NoSuchElementException:
+                        no_more_pages = True
+                        page_finished = True
+                except Exception as e:
+                    if isinstance(e, NoSuchElementException):
+                        no_more_pages = True
+                        page_finished = True
+                    else:
+                        print(f"Page/coords error: {e}. Retrying for up to 5 mins...")
+                        time.sleep(30)
+            if no_more_pages:
+                break
+            if not page_finished:
+                print("Giving up current page/coords after 5 mins of failures, moving on.")
                 break
 
     except Exception as e:
@@ -903,7 +1002,151 @@ def scrape_islamabad_listings(checkin: str, checkout: str, max_pages: int = 3) -
     return collected
 
 
+PROGRESS_FILENAME = "scrape_progress.json"
+FAILED_LISTINGS_FILENAME = "failed_listings.json"
+
+
+def _append_failed_listing_url(url: str, filepath: Optional[Path] = None) -> None:
+    """Append a failed listing URL to failed_listings.json for later retry."""
+    path = filepath or Path(FAILED_LISTINGS_FILENAME)
+    try:
+        data: Dict[str, list] = {"urls": []}
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data.get("urls"), list):
+                data["urls"] = []
+        if url not in data["urls"]:
+            data["urls"].append(url)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"Failed to save failed listing URL to {path}: {e}")
+
+
+def _load_progress(progress_path: Path, no_resume: bool) -> tuple[int, str, int]:
+    """Return (coords_index, coords_string, page) to resume from. If no_resume or no file, (0, first_coords, 1)."""
+    if no_resume or not progress_path.exists():
+        coords = islamabad_sectors[0] if islamabad_sectors else ""
+        return (0, coords, 1)
+    try:
+        with open(progress_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        idx = int(data.get("coords_index", 0))
+        cs = data.get("coords_string", islamabad_sectors[0] if islamabad_sectors else "")
+        page = int(data.get("page", 1))
+        return (max(0, idx), cs, max(1, page))
+    except Exception:
+        coords = islamabad_sectors[0] if islamabad_sectors else ""
+        return (0, coords, 1)
+
+
+def _save_progress(progress_path: Path, coords_index: int, coords_string: str, page: int) -> None:
+    try:
+        with open(progress_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"coords_index": coords_index, "coords_string": coords_string, "page": page},
+                f,
+                indent=2,
+            )
+    except Exception as e:
+        print(f"Failed to save progress: {e}")
+
+
 if __name__ == "__main__":
-    # Example usage: scrape the first two pages of results for a stay in October 2025
-    new_listings = scrape_islamabad_listings("2025-10-01", "2025-10-03", max_pages=2)
-    print(f"New listings collected this run: {len(new_listings)}")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Scrape Airbnb listings for Islamabad")
+    parser.add_argument("--checkin", default="2026-10-3", help="Check-in date YYYY-MM-DD")
+    parser.add_argument("--checkout", default="2026-10-5", help="Check-out date YYYY-MM-DD")
+    parser.add_argument("--max-pages", type=int, default=20, help="Maximum number of pages to traverse")
+    parser.add_argument("--start-page", type=int, default=1, help="Page number to start from when not resuming (1-based)")
+    parser.add_argument(
+        "--skip-pages",
+        type=str,
+        help="Comma-separated list of page numbers to skip, e.g. '2,5,7' or ranges '4-6'",
+    )
+    parser.add_argument(
+        "--progress-file",
+        default=PROGRESS_FILENAME,
+        help="Path to progress file for resume (default: scrape_progress.json)",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore saved progress and start from first coords, page 1",
+    )
+
+    args = parser.parse_args()
+
+    # Parse skip_pages string into a list of ints (support ranges like 4-6)
+    skip_pages_list: List[int] = []
+    if args.skip_pages:
+        for part in args.skip_pages.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                try:
+                    a, b = part.split("-", 1)
+                    a_i = int(a.strip())
+                    b_i = int(b.strip())
+                    if a_i <= b_i:
+                        skip_pages_list.extend(list(range(a_i, b_i + 1)))
+                except Exception:
+                    continue
+            else:
+                try:
+                    skip_pages_list.append(int(part))
+                except Exception:
+                    continue
+
+    progress_path = Path(args.progress_file)
+    coords_index_start, _, page_start = _load_progress(progress_path, args.no_resume)
+    if args.no_resume:
+        page_start = max(1, args.start_page)
+
+    all_new_listings: List[Listing] = []
+    for idx in range(coords_index_start, len(islamabad_sectors)):
+        coords = islamabad_sectors[idx]
+        start_page = page_start if idx == coords_index_start else max(1, args.start_page)
+
+        def make_on_page_done(progress_path: Path) -> Callable[[int, str, int], None]:
+            def on_page_done(ci: int, cs: str, p: int) -> None:
+                _save_progress(progress_path, ci, cs, p)
+
+            return on_page_done
+
+        print(f"Scraping coords index {idx + 1}/{len(islamabad_sectors)}: {coords[:60]}...")
+        deadline = time.monotonic() + RETRY_WINDOW_SECONDS
+        new_listings: List[Listing] = []
+        retry_start_page = start_page
+        while time.monotonic() < deadline:
+            try:
+                new_listings = scrape_islamabad_listings(
+                    args.checkin,
+                    args.checkout,
+                    max_pages=args.max_pages,
+                    start_page=retry_start_page,
+                    skip_pages=skip_pages_list,
+                    coords=coords,
+                    coords_index=idx,
+                    on_page_done=make_on_page_done(progress_path),
+                )
+                break
+            except Exception as e:
+                print(f"Coords run failed: {e}. Retrying for up to 5 mins...")
+                # Resume from last saved page for this coords if progress was updated
+                saved_idx, _, saved_page = _load_progress(progress_path, no_resume=False)
+                if saved_idx == idx:
+                    retry_start_page = saved_page
+                if time.monotonic() + 30 >= deadline:
+                    break
+                time.sleep(30)
+        all_new_listings.extend(new_listings)
+        # Next run starts at next coords, page 1
+        next_idx = idx + 1
+        next_coords = islamabad_sectors[next_idx] if next_idx < len(islamabad_sectors) else coords
+        _save_progress(progress_path, next_idx, next_coords, 1)
+
+    print(f"New listings collected this run: {len(all_new_listings)}")
