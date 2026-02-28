@@ -1,57 +1,13 @@
 import os
-import json
 import pickle
 import numpy as np
 import pandas as pd
 
 MODEL_DIR = os.path.dirname(__file__)
-SANITIZED_DIR = os.path.join(os.path.dirname(__file__), '..', 'listings-sanitized')
-
-# Cache for market data
-_market_data = None
-
-
-def _load_market_data():
-    """Load market-wide data from sanitized listings for neighborhood features."""
-    global _market_data
-    if _market_data is not None:
-        return _market_data
-
-    prices = []
-    coords = []
-    capacities = []
-    amenity_counts = []
-
-    for filename in os.listdir(SANITIZED_DIR):
-        if not filename.endswith('.json'):
-            continue
-        try:
-            with open(os.path.join(SANITIZED_DIR, filename), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            loc = data.get('location') or {}
-            p = data.get('price', 0) or 0
-            br = data.get('bedrooms', 1) or 1
-            bd = data.get('beds', 1) or 1
-            ba = data.get('baths', 1) or 1
-            am = data.get('amenities', [])
-            prices.append(p)
-            coords.append([loc.get('lat', 33.6), loc.get('lng', 73.0)])
-            capacities.append(br + bd + ba)
-            amenity_counts.append(len(am))
-        except Exception:
-            pass
-
-    _market_data = {
-        'prices': np.array(prices),
-        'coords': np.array(coords),
-        'capacities': np.array(capacities),
-        'amenity_counts': np.array(amenity_counts),
-    }
-    return _market_data
 
 
 def load_model():
-    """Load the trained model and encoders."""
+    """Load the trained model, encoders, and baked-in market data."""
     model_path = os.path.join(MODEL_DIR, 'xgb_occupancy_model.pkl')
     encoders_path = os.path.join(MODEL_DIR, 'label_encoders.pkl')
 
@@ -89,8 +45,8 @@ def predict_occupancy(listing: dict, model=None, encoders=None) -> float:
     top_amenities = encoders['top_amenities']
     amenity_categories = encoders['amenity_categories']
     market_stats = encoders['market_stats']
+    market = encoders['market_data']
 
-    market = _load_market_data()
     location = listing.get('location') or {}
     amenities = set(listing.get('amenities') or [])
 
