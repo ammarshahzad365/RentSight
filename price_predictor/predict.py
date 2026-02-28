@@ -24,8 +24,11 @@ import pandas as pd
 # ==============================================================================
 # PATHS
 # ==============================================================================
-PRICE_MODEL_DIR = os.path.dirname(__file__)
-OCCUPANCY_MODEL_DIR = os.path.join(os.path.dirname(__file__), '..', 'occupancy_predictor')
+PRICE_MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
+OCCUPANCY_MODEL_DIR = os.environ.get(
+    'OCCUPANCY_MODEL_DIR',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'occupancy_predictor'),
+)
 
 
 # ==============================================================================
@@ -253,7 +256,6 @@ def _compute_price_sensitivity(listing: dict, models: dict) -> float:
     Range: 0.5 (luxury) to 1.2 (budget).
     """
     amenities = set(listing.get('amenities') or [])
-    max_guests = max(listing.get('max_guests', 1) or 1, 1)
     bedrooms = max(listing.get('bedrooms', 1) or 1, 1)
     location = listing.get('location') or {}
     lt = listing.get('listing_type', '').lower()
