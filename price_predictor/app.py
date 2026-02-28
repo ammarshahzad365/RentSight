@@ -10,15 +10,38 @@ Endpoints:
     GET  /amenities     — List of recognised amenities
 """
 
+import os
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 from predict import load_models, predict_optimal_price, predict_market_price, get_neighborhood_prices
 
+logger = logging.getLogger("uvicorn.error")
+
 # ==============================================================================
 # APP SETUP
 # ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Lifespan — load models once at startup, release on shutdown
+# ---------------------------------------------------------------------------
+models = None
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    global models
+    logger.info("Loading price prediction models...")
+    models = load_models()
+    has_occ = models['occ_model'] is not None
+    logger.info(f"Models loaded! (occupancy model: {'yes' if has_occ else 'no'})")
+    yield  # app is running
+    logger.info("Shutting down price predictor.")
+
 
 app = FastAPI(
     title="RentSight Price Predictor API",
@@ -27,6 +50,7 @@ app = FastAPI(
         "Combines market-rate modelling with revenue optimisation."
     ),
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -36,17 +60,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-models = None
-
-
-@app.on_event("startup")
-def startup():
-    global models
-    print("Loading price prediction models...")
-    models = load_models()
-    has_occ = models['occ_model'] is not None
-    print(f"Models loaded! (occupancy model: {'yes' if has_occ else 'no'})")
 
 
 # ==============================================================================
@@ -191,7 +204,7 @@ def list_amenities():
     categories = meta.get("amenity_categories", {})
     return {
         "top_amenities": top,
-        "categories": {k: v for k, v in categories.items()},
+        "categories": dict(categories.items()),
     }
 
 
@@ -202,4 +215,4 @@ def list_amenities():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8001))
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, log_level="info")
