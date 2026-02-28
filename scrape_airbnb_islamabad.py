@@ -35,9 +35,10 @@ Important considerations:
 import json
 import time
 import re
+import sys
 from pathlib import Path
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Dict, Callable
+from typing import List, Optional, Dict, Callable, Any
 from datetime import datetime
 
 from selenium import webdriver
@@ -1025,36 +1026,170 @@ def _append_failed_listing_url(url: str, filepath: Optional[Path] = None) -> Non
 
 
 def _load_progress(progress_path: Path, no_resume: bool) -> tuple[int, str, int]:
-    """Return (coords_index, coords_string, page) to resume from. If no_resume or no file, (0, first_coords, 1)."""
+    """Return (coords_index, coords_string, page) for FORWARD runner. If no_resume or no file, (0, first_coords, 1)."""
     if no_resume or not progress_path.exists():
         coords = islamabad_sectors[0] if islamabad_sectors else ""
         return (0, coords, 1)
     try:
         with open(progress_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        idx = int(data.get("coords_index", 0))
-        cs = data.get("coords_string", islamabad_sectors[0] if islamabad_sectors else "")
-        page = int(data.get("page", 1))
+        idx = int(data.get("forward_coords_index", data.get("coords_index", 0)))
+        cs = data.get("forward_coords_string", data.get("coords_string", islamabad_sectors[0] if islamabad_sectors else ""))
+        page = int(data.get("forward_page", data.get("page", 1)))
         return (max(0, idx), cs, max(1, page))
     except Exception:
         coords = islamabad_sectors[0] if islamabad_sectors else ""
         return (0, coords, 1)
 
 
-def _save_progress(progress_path: Path, coords_index: int, coords_string: str, page: int) -> None:
+def _load_reverse_progress(progress_path: Path, no_resume: bool) -> tuple[int, str, int]:
+    """Return (coords_index, coords_string, page) for REVERSE runner (end→first). If no resume, (len-1, last_coords, 1)."""
+    n = len(islamabad_sectors)
+    if n == 0:
+        return (0, "", 1)
+    last_coords = islamabad_sectors[n - 1]
+    if no_resume or not progress_path.exists():
+        return (n - 1, last_coords, 1)
     try:
+        with open(progress_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        idx = data.get("reverse_coords_index")
+        if idx is None:
+            return (n - 1, last_coords, 1)
+        idx = int(idx)
+        cs = data.get("reverse_coords_string", islamabad_sectors[idx] if 0 <= idx < n else last_coords)
+        page = int(data.get("reverse_page", 1))
+        return (max(0, min(n - 1, idx)), cs, max(1, page))
+    except Exception:
+        return (n - 1, last_coords, 1)
+
+
+def _save_progress_runner(
+    progress_path: Path,
+    runner: str,
+    coords_index: int,
+    coords_string: str,
+    page: int,
+    lock: Optional[Any] = None,
+) -> None:
+    """Save one runner's progress; merge with existing JSON so the other runner's data is kept. Optional lock for multiprocessing."""
+    if lock is not None:
+        lock.acquire()
+    try:
+        data: Dict = {}
+        if progress_path.exists():
+            try:
+                with open(progress_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                pass
+        prefix = "forward" if runner == "forward" else "reverse"
+        data[f"{prefix}_coords_index"] = coords_index
+        data[f"{prefix}_coords_string"] = coords_string
+        data[f"{prefix}_page"] = page
+        if runner == "forward":
+            data["coords_index"] = coords_index
+            data["coords_string"] = coords_string
+            data["page"] = page
         with open(progress_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {"coords_index": coords_index, "coords_string": coords_string, "page": page},
-                f,
-                indent=2,
-            )
+            json.dump(data, f, indent=2)
     except Exception as e:
         print(f"Failed to save progress: {e}")
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _save_progress(progress_path: Path, coords_index: int, coords_string: str, page: int, lock: Optional[Any] = None) -> None:
+    """Save FORWARD runner progress. Merges with existing file so reverse progress is preserved."""
+    _save_progress_runner(progress_path, "forward", coords_index, coords_string, page, lock)
+
+
+def _save_reverse_progress(progress_path: Path, coords_index: int, coords_string: str, page: int, lock: Optional[Any] = None) -> None:
+    """Save REVERSE runner progress. Merges with existing file so forward progress is preserved."""
+    _save_progress_runner(progress_path, "reverse", coords_index, coords_string, page, lock)
+
+
+def _run_runner_worker(
+    runner: str,
+    indices: List[int],
+    first_start_page: int,
+    checkin: str,
+    checkout: str,
+    max_pages: int,
+    skip_pages_list: List[int],
+    progress_path_str: str,
+    lock: Any,
+) -> None:
+    """Worker run in a separate process: scrapes the given coords indices for one runner. Writes listings to disk and progress with lock."""
+    # Prefix all print output in this process with the runner name
+    import builtins
+    _original_print = builtins.print
+    _prefix = f"[{runner.upper()}]"
+
+    def _prefixed_print(*args, **kwargs):
+        if args:
+            _original_print(_prefix, *args, **kwargs)
+        else:
+            _original_print(_prefix, **kwargs)
+
+    builtins.print = _prefixed_print
+
+    progress_path = Path(progress_path_str)
+    n_sectors = len(islamabad_sectors)
+
+    def make_on_page_done(runner_name: str) -> Callable[[int, str, int], None]:
+        def on_page_done(ci: int, cs: str, p: int) -> None:
+            if runner_name == "forward":
+                _save_progress(progress_path, ci, cs, p, lock)
+            else:
+                _save_reverse_progress(progress_path, ci, cs, p, lock)
+        return on_page_done
+
+    for i, idx in enumerate(indices):
+        coords = islamabad_sectors[idx]
+        start_page = first_start_page if i == 0 else 1
+        print(f"Scraping coords index {idx + 1}/{n_sectors} (start_page={start_page}): {coords[:60]}...")
+        deadline = time.monotonic() + RETRY_WINDOW_SECONDS
+        retry_start_page = start_page
+        while time.monotonic() < deadline:
+            try:
+                scrape_islamabad_listings(
+                    checkin,
+                    checkout,
+                    max_pages=max_pages,
+                    start_page=retry_start_page,
+                    skip_pages=skip_pages_list,
+                    coords=coords,
+                    coords_index=idx,
+                    on_page_done=make_on_page_done(runner),
+                )
+                break
+            except Exception as e:
+                print(f"Coords idx={idx} failed: {e}. Retrying...", file=sys.stderr)
+                if runner == "forward":
+                    saved_idx, _, saved_page = _load_progress(progress_path, no_resume=False)
+                else:
+                    saved_idx, _, saved_page = _load_reverse_progress(progress_path, no_resume=False)
+                if saved_idx == idx:
+                    retry_start_page = saved_page
+                if time.monotonic() + 30 >= deadline:
+                    break
+                time.sleep(30)
+        # Advance progress: forward goes +1, reverse goes -1
+        if runner == "forward":
+            next_idx = idx + 1
+            next_cs = islamabad_sectors[next_idx] if next_idx < n_sectors else coords
+            _save_progress(progress_path, next_idx, next_cs, 1, lock)
+        else:
+            next_idx = idx - 1
+            next_cs = islamabad_sectors[next_idx] if next_idx >= 0 else coords
+            _save_reverse_progress(progress_path, next_idx, next_cs, 1, lock)
 
 
 if __name__ == "__main__":
     import argparse
+    import multiprocessing
 
     parser = argparse.ArgumentParser(description="Scrape Airbnb listings for Islamabad")
     parser.add_argument("--checkin", default="2026-10-3", help="Check-in date YYYY-MM-DD")
@@ -1102,51 +1237,76 @@ if __name__ == "__main__":
                     continue
 
     progress_path = Path(args.progress_file)
-    coords_index_start, _, page_start = _load_progress(progress_path, args.no_resume)
+    n_sectors = len(islamabad_sectors)
+    if n_sectors == 0:
+        print("No coords (islamabad_sectors) to scrape.")
+        sys.exit(0)
+
+    # Load both runners: forward (first→end), reverse (end→first)
+    forward_idx, _, forward_page = _load_progress(progress_path, args.no_resume)
+    reverse_idx, _, reverse_page = _load_reverse_progress(progress_path, args.no_resume)
     if args.no_resume:
-        page_start = max(1, args.start_page)
+        forward_page = max(1, args.start_page)
+        reverse_page = 1
 
-    all_new_listings: List[Listing] = []
-    for idx in range(coords_index_start, len(islamabad_sectors)):
-        coords = islamabad_sectors[idx]
-        start_page = page_start if idx == coords_index_start else max(1, args.start_page)
+    # Stop when they would surpass each other
+    if forward_idx > reverse_idx:
+        print("Runners already met (forward_idx > reverse_idx). Nothing to do.")
+        sys.exit(0)
 
-        def make_on_page_done(progress_path: Path) -> Callable[[int, str, int], None]:
-            def on_page_done(ci: int, cs: str, p: int) -> None:
-                _save_progress(progress_path, ci, cs, p)
+    # Partition work so they never double-scrape: when they meet at one coords, only forward does it.
+    # Forward: indices [forward_idx .. reverse_idx] inclusive.
+    # Reverse: indices [reverse_idx-1 .. forward_idx] descending (so reverse does not do reverse_idx).
+    forward_indices: List[int] = list(range(forward_idx, reverse_idx + 1))
+    reverse_indices: List[int] = list(range(reverse_idx - 1, forward_idx - 1, -1))  # reverse_idx-1 down to forward_idx
 
-            return on_page_done
+    if not forward_indices and not reverse_indices:
+        print("No indices to scrape.")
+        sys.exit(0)
 
-        print(f"Scraping coords index {idx + 1}/{len(islamabad_sectors)}: {coords[:60]}...")
-        deadline = time.monotonic() + RETRY_WINDOW_SECONDS
-        new_listings: List[Listing] = []
-        retry_start_page = start_page
-        while time.monotonic() < deadline:
-            try:
-                new_listings = scrape_islamabad_listings(
-                    args.checkin,
-                    args.checkout,
-                    max_pages=args.max_pages,
-                    start_page=retry_start_page,
-                    skip_pages=skip_pages_list,
-                    coords=coords,
-                    coords_index=idx,
-                    on_page_done=make_on_page_done(progress_path),
-                )
-                break
-            except Exception as e:
-                print(f"Coords run failed: {e}. Retrying for up to 5 mins...")
-                # Resume from last saved page for this coords if progress was updated
-                saved_idx, _, saved_page = _load_progress(progress_path, no_resume=False)
-                if saved_idx == idx:
-                    retry_start_page = saved_page
-                if time.monotonic() + 30 >= deadline:
-                    break
-                time.sleep(30)
-        all_new_listings.extend(new_listings)
-        # Next run starts at next coords, page 1
-        next_idx = idx + 1
-        next_coords = islamabad_sectors[next_idx] if next_idx < len(islamabad_sectors) else coords
-        _save_progress(progress_path, next_idx, next_coords, 1)
+    print(f"FORWARD runner: {len(forward_indices)} coords (indices {forward_idx}..{reverse_idx})")
+    print(f"REVERSE runner: {len(reverse_indices)} coords (indices {reverse_idx-1}..{forward_idx})")
+    print("Starting both runners simultaneously...")
 
-    print(f"New listings collected this run: {len(all_new_listings)}")
+    lock = multiprocessing.Lock()
+    progress_path_str = str(progress_path.resolve())
+
+    forward_process = multiprocessing.Process(
+        target=_run_runner_worker,
+        args=(
+            "forward",
+            forward_indices,
+            forward_page,
+            args.checkin,
+            args.checkout,
+            args.max_pages,
+            skip_pages_list,
+            progress_path_str,
+            lock,
+        ),
+    )
+    reverse_process = multiprocessing.Process(
+        target=_run_runner_worker,
+        args=(
+            "reverse",
+            reverse_indices,
+            1,  # reverse first coords is reverse_idx-1; no per-coords resume for that
+            args.checkin,
+            args.checkout,
+            args.max_pages,
+            skip_pages_list,
+            progress_path_str,
+            lock,
+        ),
+    )
+
+    forward_process.start()
+    reverse_process.start()
+    forward_process.join()
+    reverse_process.join()
+
+    if forward_process.exitcode != 0:
+        print(f"FORWARD process exited with code {forward_process.exitcode}", file=sys.stderr)
+    if reverse_process.exitcode != 0:
+        print(f"REVERSE process exited with code {reverse_process.exitcode}", file=sys.stderr)
+    print("Both runners finished.")
