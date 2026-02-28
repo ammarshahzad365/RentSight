@@ -1,14 +1,14 @@
 import os
 import json
-import matplotlib.pyplot as plt
+import folium
+from folium.plugins import MarkerCluster
 
 # Directory containing the sanitized listings
 listings_dir = os.path.join(os.path.dirname(__file__), '..', 'listings-sanitized')
 
 def visualize_locations():
-    """Visualize listing locations on a 2D plot."""
-    latitudes = []
-    longitudes = []
+    """Visualize listing locations on an interactive map."""
+    locations = []
     missing_location_count = 0
     
     for filename in os.listdir(listings_dir):
@@ -26,8 +26,19 @@ def visualize_locations():
                 lat = location.get('lat')
                 lng = location.get('lng')
                 if lat is not None and lng is not None:
-                    latitudes.append(lat)
-                    longitudes.append(lng)
+                    # Extract some info for the popup
+                    title = data.get('title', 'Untitled')
+                    price = data.get('price', 'N/A')
+                    url = data.get('url', '#')
+                    
+                    locations.append({
+                        'lat': lat,
+                        'lng': lng,
+                        'title': title,
+                        'price': price,
+                        'url': url,
+                        'filename': filename
+                    })
                 else:
                     missing_location_count += 1
             else:
@@ -36,37 +47,57 @@ def visualize_locations():
         except Exception as e:
             print(f"Error processing file {filename}: {str(e)}")
     
-    # Create the plot
-    plt.figure(figsize=(12, 8))
-    plt.scatter(longitudes, latitudes, alpha=0.6, c='blue', edgecolors='darkblue', s=50)
+    if not locations:
+        print("No locations found to display on map!")
+        return
     
-    plt.xlabel('Longitude', fontsize=12)
-    plt.ylabel('Latitude', fontsize=12)
-    plt.title(f'Airbnb Listing Locations\n({len(latitudes)} listings plotted, {missing_location_count} without location)', 
-              fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3)
+    # Calculate center of all locations
+    center_lat = sum(loc['lat'] for loc in locations) / len(locations)
+    center_lng = sum(loc['lng'] for loc in locations) / len(locations)
     
-    # Add some statistics as text on the plot
-    if latitudes and longitudes:
-        stats_text = f'Lat Range: {min(latitudes):.3f} to {max(latitudes):.3f}\n'
-        stats_text += f'Lng Range: {min(longitudes):.3f} to {max(longitudes):.3f}'
-        plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
-                fontsize=10, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    # Create the map centered on the average location
+    map_obj = folium.Map(
+        location=[center_lat, center_lng],
+        zoom_start=12,
+        tiles='OpenStreetMap'
+    )
     
-    plt.tight_layout()
+    # Add marker cluster for better performance with many markers
+    marker_cluster = MarkerCluster().add_to(map_obj)
     
-    # Save the plot
-    output_file = os.path.join(os.path.dirname(__file__), 'locations_plot.png')
-    plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"\nPlot saved to: {output_file}")
+    # Add markers for each listing
+    for loc in locations:
+        popup_html = f"""
+        <div style="width: 200px;">
+            <b>{loc['title']}</b><br>
+            <b>Price:</b> {loc['price']}<br>
+            <a href="{loc['url']}" target="_blank">View Listing</a>
+        </div>
+        """
+        
+        folium.Marker(
+            location=[loc['lat'], loc['lng']],
+            popup=folium.Popup(popup_html, max_width=250),
+            tooltip=f"{loc['title']} - {loc['price']}",
+            icon=folium.Icon(color='blue', icon='home', prefix='fa')
+        ).add_to(marker_cluster)
     
-    # Show the plot
-    plt.show()
+    # Save the map
+    output_file = os.path.join(os.path.dirname(__file__), 'locations_map.html')
+    map_obj.save(output_file)
+    print(f"\nInteractive map saved to: {output_file}")
+    print(f"Open this file in a web browser to view the map.")
     
     print(f"\nSummary:")
-    print(f"  Total listings plotted: {len(latitudes)}")
+    print(f"  Total listings plotted: {len(locations)}")
     print(f"  Listings without location: {missing_location_count}")
+    
+    # Calculate and display coordinate ranges
+    if locations:
+        all_lats = [loc['lat'] for loc in locations]
+        all_lngs = [loc['lng'] for loc in locations]
+        print(f"  Latitude range: {min(all_lats):.4f} to {max(all_lats):.4f}")
+        print(f"  Longitude range: {min(all_lngs):.4f} to {max(all_lngs):.4f}")
 
 if __name__ == "__main__":
     visualize_locations()

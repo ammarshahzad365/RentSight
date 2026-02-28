@@ -6,3 +6,4 @@ __pycache__/
 listings-sanitized.zip
 *.txt
 listing-sanitizer/add_occupancy_rate.py
+.venv/
