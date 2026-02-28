@@ -24,11 +24,8 @@ import pandas as pd
 # ==============================================================================
 # PATHS
 # ==============================================================================
-PRICE_MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
-OCCUPANCY_MODEL_DIR = os.environ.get(
-    'OCCUPANCY_MODEL_DIR',
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'occupancy_predictor'),
-)
+PRICE_MODEL_DIR = os.path.dirname(__file__)
+OCCUPANCY_MODEL_DIR = os.path.join(os.path.dirname(__file__), '..', 'occupancy_predictor')
 
 
 # ==============================================================================
