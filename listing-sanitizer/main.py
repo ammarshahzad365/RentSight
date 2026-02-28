@@ -23,6 +23,7 @@ def main():
         ('sanitize_reviews.py', 'Sanitizing reviews'),
         ('sanitize_url.py', 'Sanitizing URLs'),
         ('sanitize_location.py', 'Sanitizing location data'),
+        ('sanitize_amenities.py', 'Sanitizing amenities'),
         ('sanitize_cleanup.py', 'Final cleanup'),
         ('validate_fields.py', 'Validating required fields')
     ]
