@@ -5,6 +5,7 @@ listings-sanitized/
 __pycache__/
 listings-sanitized.zip
 *.txt
+!price_predictor/requirements.txt
 !occupancy_predictor/requirements.txt
 listing-sanitizer/add_occupancy_rate.py
 .venv/
