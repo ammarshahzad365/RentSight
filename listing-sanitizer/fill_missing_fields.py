@@ -1,8 +1,9 @@
 import os
 import json
+from utils import get_sanitized_directory
 
-# Directory containing the original listings
-listings_dir = os.path.join(os.path.dirname(__file__), '..', 'listings')
+# Directory containing the sanitized listings
+listings_dir = get_sanitized_directory()
 
 def calculate_averages():
     """Calculate average values for bedrooms, beds, baths, and max_guests."""
