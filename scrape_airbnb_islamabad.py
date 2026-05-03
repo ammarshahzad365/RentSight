@@ -51,7 +51,43 @@ from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 
-from islamabad_sectors import islamabad_sectors
+from islamabad_sectors import lahore_areas, karachi_areas, islamabad_sectors, faisalabad_areas
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# City → bounding-box list resolver
+# Add a new city here by inserting another elif branch.
+# ─────────────────────────────────────────────────────────────────────────────
+
+CITY_SEARCH_NAMES: dict[str, str] = {
+    "islamabad": "Islamabad--Pakistan",
+    "lahore":    "Lahore--Pakistan",
+    "karachi":   "Karachi--Pakistan",
+    "faisalabad": "Faisalabad--Pakistan",
+}
+
+
+def get_areas(city: str) -> list:
+    """Return the bounding-box list for *city* (case-insensitive).
+
+    Raises ValueError for unknown cities so the caller gets a clear message.
+    To add a new city (e.g. Faisalabad) just add its data list to
+    islamabad_sectors.py, import it here, insert an elif branch below, and
+    add its Airbnb search slug to CITY_SEARCH_NAMES above.
+    """
+    city = city.lower().strip()
+    if city == "islamabad":
+        return islamabad_sectors
+    elif city == "lahore":
+        return lahore_areas
+    elif city == "karachi":
+        return karachi_areas
+    elif city == "faisalabad":
+        return faisalabad_areas
+    else:
+        raise ValueError(
+            f"Unknown city '{city}'. Supported cities: {', '.join(CITY_SEARCH_NAMES)}"
+        )
 
 # Global set of listing IDs already scraped (loaded once at import)
 EXISTING_LISTING_IDS: set[str] = set()
@@ -74,7 +110,8 @@ def _init_existing_ids(directory: str = "listings") -> None:
             if listing_id:
                 EXISTING_LISTING_IDS.add(listing_id)
 
-_init_existing_ids()
+# _init_existing_ids() is called inside scrape_islamabad_listings() once the
+# city (and therefore the listings directory) is known.
 
 @dataclass
 class Review:
@@ -767,19 +804,25 @@ def scrape_islamabad_listings(
     coords: str = "",
     coords_index: Optional[int] = None,
     on_page_done: Optional[Callable[[int, str, int], None]] = None,
+    city: str = "islamabad",
 ) -> List[Listing]:
     """
     Navigate through Airbnb search results for Islamabad and collect data
     for listings appearing in the specified number of result pages.  The
     check-in/check-out dates should be provided in YYYY-MM-DD format.
     """
+    # Derive the city-specific listings directory (e.g. "listings-lahore")
+    listings_dir = f"listings-{city.lower()}"
+    # Populate the global skip-set from existing files in this city's dir
+    _init_existing_ids(listings_dir)
     # Build lightweight index from filenames only (no JSON load)
-    listing_index = load_existing_listing_index()
-    print(f"Found {sum(len(v) for v in listing_index.values())} existing listing files")
+    listing_index = load_existing_listing_index(listings_dir)
+    print(f"Found {sum(len(v) for v in listing_index.values())} existing listing files in '{listings_dir}'")
     
     # Build search URL (1 guest by default to keep results broad)
+    city_slug = CITY_SEARCH_NAMES.get(city.lower(), "Islamabad--Pakistan")
     search_url = (
-        f"https://www.airbnb.com/s/Islamabad--Pakistan/homes?checkin={checkin}"
+        f"https://www.airbnb.com/s/{city_slug}/homes?checkin={checkin}"
         f"&checkout={checkout}&adults=1&zoom=15.5327873717292&search_by_map=true"
         f"&{coords}"
     )
@@ -945,7 +988,7 @@ def scrape_islamabad_listings(
                                     else:
                                         collected.append(listing_data)
                                         listing_index.setdefault(listing_data.id, set()).add(scrape_date)
-                                        out_dir = Path("listings")
+                                        out_dir = Path(listings_dir)
                                         out_dir.mkdir(parents=True, exist_ok=True)
                                         filename = out_dir / f"{listing_data.id}_{scrape_date}.json"
                                         try:
@@ -1025,29 +1068,29 @@ def _append_failed_listing_url(url: str, filepath: Optional[Path] = None) -> Non
         print(f"Failed to save failed listing URL to {path}: {e}")
 
 
-def _load_progress(progress_path: Path, no_resume: bool) -> tuple[int, str, int]:
+def _load_progress(progress_path: Path, no_resume: bool, areas: list) -> tuple[int, str, int]:
     """Return (coords_index, coords_string, page) for FORWARD runner. If no_resume or no file, (0, first_coords, 1)."""
     if no_resume or not progress_path.exists():
-        coords = islamabad_sectors[0] if islamabad_sectors else ""
+        coords = areas[0] if areas else ""
         return (0, coords, 1)
     try:
         with open(progress_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         idx = int(data.get("forward_coords_index", data.get("coords_index", 0)))
-        cs = data.get("forward_coords_string", data.get("coords_string", islamabad_sectors[0] if islamabad_sectors else ""))
+        cs = data.get("forward_coords_string", data.get("coords_string", areas[0] if areas else ""))
         page = int(data.get("forward_page", data.get("page", 1)))
         return (max(0, idx), cs, max(1, page))
     except Exception:
-        coords = islamabad_sectors[0] if islamabad_sectors else ""
+        coords = areas[0] if areas else ""
         return (0, coords, 1)
 
 
-def _load_reverse_progress(progress_path: Path, no_resume: bool) -> tuple[int, str, int]:
+def _load_reverse_progress(progress_path: Path, no_resume: bool, areas: list) -> tuple[int, str, int]:
     """Return (coords_index, coords_string, page) for REVERSE runner (end→first). If no resume, (len-1, last_coords, 1)."""
-    n = len(islamabad_sectors)
+    n = len(areas)
     if n == 0:
         return (0, "", 1)
-    last_coords = islamabad_sectors[n - 1]
+    last_coords = areas[n - 1]
     if no_resume or not progress_path.exists():
         return (n - 1, last_coords, 1)
     try:
@@ -1057,7 +1100,7 @@ def _load_reverse_progress(progress_path: Path, no_resume: bool) -> tuple[int, s
         if idx is None:
             return (n - 1, last_coords, 1)
         idx = int(idx)
-        cs = data.get("reverse_coords_string", islamabad_sectors[idx] if 0 <= idx < n else last_coords)
+        cs = data.get("reverse_coords_string", areas[idx] if 0 <= idx < n else last_coords)
         page = int(data.get("reverse_page", 1))
         return (max(0, min(n - 1, idx)), cs, max(1, page))
     except Exception:
@@ -1120,6 +1163,7 @@ def _run_runner_worker(
     skip_pages_list: List[int],
     progress_path_str: str,
     lock: Any,
+    city: str,
 ) -> None:
     """Worker run in a separate process: scrapes the given coords indices for one runner. Writes listings to disk and progress with lock."""
     # Prefix all print output in this process with the runner name
@@ -1136,7 +1180,8 @@ def _run_runner_worker(
     builtins.print = _prefixed_print
 
     progress_path = Path(progress_path_str)
-    n_sectors = len(islamabad_sectors)
+    areas = get_areas(city)
+    n_sectors = len(areas)
 
     def make_on_page_done(runner_name: str) -> Callable[[int, str, int], None]:
         def on_page_done(ci: int, cs: str, p: int) -> None:
@@ -1147,7 +1192,7 @@ def _run_runner_worker(
         return on_page_done
 
     for i, idx in enumerate(indices):
-        coords = islamabad_sectors[idx]
+        coords = areas[idx]
         start_page = first_start_page if i == 0 else 1
         print(f"Scraping coords index {idx + 1}/{n_sectors} (start_page={start_page}): {coords[:60]}...")
         deadline = time.monotonic() + RETRY_WINDOW_SECONDS
@@ -1163,14 +1208,15 @@ def _run_runner_worker(
                     coords=coords,
                     coords_index=idx,
                     on_page_done=make_on_page_done(runner),
+                    city=city,
                 )
                 break
             except Exception as e:
                 print(f"Coords idx={idx} failed: {e}. Retrying...", file=sys.stderr)
                 if runner == "forward":
-                    saved_idx, _, saved_page = _load_progress(progress_path, no_resume=False)
+                    saved_idx, _, saved_page = _load_progress(progress_path, no_resume=False, areas=areas)
                 else:
-                    saved_idx, _, saved_page = _load_reverse_progress(progress_path, no_resume=False)
+                    saved_idx, _, saved_page = _load_reverse_progress(progress_path, no_resume=False, areas=areas)
                 if saved_idx == idx:
                     retry_start_page = saved_page
                 if time.monotonic() + 30 >= deadline:
@@ -1179,11 +1225,11 @@ def _run_runner_worker(
         # Advance progress: forward goes +1, reverse goes -1
         if runner == "forward":
             next_idx = idx + 1
-            next_cs = islamabad_sectors[next_idx] if next_idx < n_sectors else coords
+            next_cs = areas[next_idx] if next_idx < n_sectors else coords
             _save_progress(progress_path, next_idx, next_cs, 1, lock)
         else:
             next_idx = idx - 1
-            next_cs = islamabad_sectors[next_idx] if next_idx >= 0 else coords
+            next_cs = areas[next_idx] if next_idx >= 0 else coords
             _save_reverse_progress(progress_path, next_idx, next_cs, 1, lock)
 
 
@@ -1191,7 +1237,13 @@ if __name__ == "__main__":
     import argparse
     import multiprocessing
 
-    parser = argparse.ArgumentParser(description="Scrape Airbnb listings for Islamabad")
+    parser = argparse.ArgumentParser(description="Scrape Airbnb listings for a Pakistan city")
+    parser.add_argument(
+        "--city",
+        default="islamabad",
+        choices=list(CITY_SEARCH_NAMES.keys()),
+        help="City to scrape: islamabad, lahore, or karachi (default: islamabad)",
+    )
     parser.add_argument("--checkin", default="2026-10-3", help="Check-in date YYYY-MM-DD")
     parser.add_argument("--checkout", default="2026-10-5", help="Check-out date YYYY-MM-DD")
     parser.add_argument("--max-pages", type=int, default=20, help="Maximum number of pages to traverse")
@@ -1203,8 +1255,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--progress-file",
-        default=PROGRESS_FILENAME,
-        help="Path to progress file for resume (default: scrape_progress.json)",
+        default=None,
+        help="Path to progress file for resume (default: scrape_progress-{city}.json)",
     )
     parser.add_argument(
         "--no-resume",
@@ -1213,6 +1265,9 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # Resolve the bounding-box list for the chosen city
+    areas = get_areas(args.city)
 
     # Parse skip_pages string into a list of ints (support ranges like 4-6)
     skip_pages_list: List[int] = []
@@ -1236,15 +1291,19 @@ if __name__ == "__main__":
                 except Exception:
                     continue
 
-    progress_path = Path(args.progress_file)
-    n_sectors = len(islamabad_sectors)
+    # Default progress file is city-scoped; can be overridden with --progress-file
+    progress_file = args.progress_file or f"scrape_progress-{args.city}.json"
+    progress_path = Path(progress_file)
+    n_sectors = len(areas)
     if n_sectors == 0:
-        print("No coords (islamabad_sectors) to scrape.")
+        print(f"No coords for city '{args.city}'.")
         sys.exit(0)
 
+    print(f"City: {args.city} ({n_sectors} bounding-box entries)")
+
     # Load both runners: forward (first→end), reverse (end→first)
-    forward_idx, _, forward_page = _load_progress(progress_path, args.no_resume)
-    reverse_idx, _, reverse_page = _load_reverse_progress(progress_path, args.no_resume)
+    forward_idx, _, forward_page = _load_progress(progress_path, args.no_resume, areas)
+    reverse_idx, _, reverse_page = _load_reverse_progress(progress_path, args.no_resume, areas)
     if args.no_resume:
         forward_page = max(1, args.start_page)
         reverse_page = 1
@@ -1283,6 +1342,7 @@ if __name__ == "__main__":
             skip_pages_list,
             progress_path_str,
             lock,
+            args.city,
         ),
     )
     reverse_process = multiprocessing.Process(
@@ -1297,6 +1357,7 @@ if __name__ == "__main__":
             skip_pages_list,
             progress_path_str,
             lock,
+            args.city,
         ),
     )
 

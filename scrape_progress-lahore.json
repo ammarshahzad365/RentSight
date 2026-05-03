@@ -1,0 +1,11 @@
+{
+  "reverse_coords_index": 106,
+  "reverse_coords_string": "ne_lat=31.5450&ne_lng=74.2830&sw_lat=31.5350&sw_lng=74.2730",
+  "reverse_page": 1,
+  "forward_coords_index": 101,
+  "forward_coords_string": "ne_lat=31.5340&ne_lng=74.3020&sw_lat=31.5240&sw_lng=74.2920",
+  "forward_page": 1,
+  "coords_index": 101,
+  "coords_string": "ne_lat=31.5340&ne_lng=74.3020&sw_lat=31.5240&sw_lng=74.2920",
+  "page": 1
+}

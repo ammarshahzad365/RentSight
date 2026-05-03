@@ -19,7 +19,7 @@ from pymongo import MongoClient, ReplaceOne
 
 
 LISTINGS_DIR = "listings"
-DB_NAME = os.environ.get("MONGO_DB", "rentsightlistings")
+DB_NAME = os.environ.get("MONGO_DB", "rentsight")
 COLLECTION_NAME = os.environ.get("MONGO_COLLECTION", "listings")
 # MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
 MONGO_URI = 'mongodb+srv://amunim_db_user:oluDyD9UrXmNOF3c@rentsight.pxc0yaz.mongodb.net/'

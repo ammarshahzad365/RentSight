@@ -1,3 +1,5 @@
 venv/
 listings/
+listing*/
 __pycache__/
+listings*
