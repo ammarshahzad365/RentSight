@@ -2,17 +2,18 @@
 RentSight Price Predictor — Model Training Pipeline
 =====================================================
 Trains an XGBoost model to predict the *market price* of a listing based on its
-features (room type, capacity, location, amenities).  A second optimisation pass
-uses the companion occupancy-predictor model to find the revenue-maximising
-price for any new listing.
+features (room type, capacity, location, amenities).
 
 Usage:
-    python train_model.py
+    python train_model.py --city islamabad
+    python train_model.py --city lahore
+    python train_model.py --city karachi
 """
 
 import os
 import json
 import pickle
+import argparse
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split, cross_val_score, KFold
@@ -21,10 +22,25 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
 # ==============================================================================
+# CLI
+# ==============================================================================
+
+VALID_CITIES = ['islamabad', 'lahore', 'karachi']
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train the price predictor for a city.')
+    parser.add_argument(
+        '--city',
+        choices=VALID_CITIES,
+        default='islamabad',
+        help='City dataset to train on (default: islamabad)',
+    )
+    return parser.parse_args()
+
+# ==============================================================================
 # CONFIG
 # ==============================================================================
-SANITIZED_DIR = os.path.join(os.path.dirname(__file__), '..', 'listings-sanitized')
-MODEL_DIR = os.path.dirname(__file__)
+
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 
@@ -107,14 +123,14 @@ AMENITY_CATEGORIES = {
 # DATA LOADING
 # ==============================================================================
 
-def load_listings():
+def load_listings(sanitized_dir):
     """Load all sanitized listings into a pandas DataFrame."""
     records = []
-    for filename in os.listdir(SANITIZED_DIR):
+    for filename in os.listdir(sanitized_dir):
         if not filename.endswith('.json'):
             continue
         try:
-            with open(os.path.join(SANITIZED_DIR, filename), 'r', encoding='utf-8') as f:
+            with open(os.path.join(sanitized_dir, filename), 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
             location = data.get('location') or {}
@@ -134,11 +150,9 @@ def load_listings():
                 'amenity_count': len(amenities),
             }
 
-            # Binary flags for top amenities
             for am in TOP_AMENITIES:
                 record[f'am_{am}'] = int(am in amenities)
 
-            # Category counts
             for cat, keywords in AMENITY_CATEGORIES.items():
                 record[f'cat_{cat}'] = sum(1 for k in keywords if k in amenities)
 
@@ -158,8 +172,7 @@ def load_listings():
 def compute_neighborhood_stats(df):
     """
     For each listing compute stats of nearby listings within ~1 km.
-    These are purely structural — no price leakage because we compute
-    neighbourhood *feature* averages, not price directly.
+    These are purely structural — no price leakage.
     """
     from scipy.spatial import cKDTree
 
@@ -200,7 +213,6 @@ def engineer_features(df):
     bedrooms = df['bedrooms'].clip(lower=1)
     max_guests = df['max_guests'].clip(lower=1)
 
-    # --- Size / capacity features ---
     df['total_capacity'] = df['bedrooms'] + df['beds'] + df['baths']
     df['size_score'] = df['bedrooms'] * 2 + df['beds'] + df['baths'] * 1.5
     df['guests_per_bedroom'] = df['max_guests'] / bedrooms
@@ -211,7 +223,6 @@ def engineer_features(df):
         (df['bedrooms'].between(2, 3)) & (df['max_guests'].between(4, 6))
     ).astype(int)
 
-    # --- Location features ---
     center_lat = df['lat'].median()
     center_lng = df['lng'].median()
     df['dist_from_center'] = np.sqrt(
@@ -219,10 +230,8 @@ def engineer_features(df):
     )
     df['lat_lng_interaction'] = df['lat'] * df['lng']
 
-    # --- Neighborhood features ---
     df = compute_neighborhood_stats(df)
 
-    # --- Categorical encoding ---
     le_listing = LabelEncoder()
     le_room = LabelEncoder()
     df['listing_type_enc'] = le_listing.fit_transform(df['listing_type'].fillna('Unknown'))
@@ -230,12 +239,10 @@ def engineer_features(df):
     df['is_entire'] = df['listing_type'].str.lower().str.contains('entire', na=False).astype(int)
     df['is_room'] = df['listing_type'].str.lower().str.contains('room', na=False).astype(int)
 
-    # --- Amenity-derived features ---
     df['amenity_richness'] = df['amenity_count'] / df['amenity_count'].max()
     df['amenity_per_guest'] = df['amenity_count'] / max_guests
     df['amenity_per_bedroom'] = df['amenity_count'] / bedrooms
 
-    # --- Store stats ---
     df.attrs['center_lat'] = center_lat
     df.attrs['center_lng'] = center_lng
     df.attrs['max_amenity_count'] = int(df['amenity_count'].max())
@@ -248,19 +255,13 @@ def engineer_features(df):
 # ==============================================================================
 
 BASE_FEATURES = [
-    # Raw capacity
     'max_guests', 'bedrooms', 'beds', 'baths', 'lat', 'lng',
-    # Categorical
     'listing_type_enc', 'room_type_enc', 'is_entire', 'is_room',
-    # Size / capacity ratios
     'total_capacity', 'size_score', 'guests_per_bedroom',
     'beds_per_bedroom', 'baths_per_bedroom', 'beds_to_guests', 'is_sweet_spot',
-    # Location derived
     'dist_from_center', 'lat_lng_interaction',
-    # Neighborhood
     'neighbor_count', 'neighbor_avg_capacity',
     'neighbor_avg_amenities', 'amenities_vs_neighborhood',
-    # Amenity aggregate
     'amenity_count', 'amenity_richness', 'amenity_per_guest', 'amenity_per_bedroom',
 ]
 
@@ -279,7 +280,6 @@ def train_model(df):
 
     df = df.dropna(subset=[TARGET_COL]).copy()
 
-    # Remove extreme outliers (bottom 0.5% and top 0.5%)
     low = df[TARGET_COL].quantile(0.005)
     high = df[TARGET_COL].quantile(0.995)
     df = df[(df[TARGET_COL] >= low) & (df[TARGET_COL] <= high)].copy()
@@ -288,14 +288,13 @@ def train_model(df):
     df[FEATURE_COLS] = df[FEATURE_COLS].fillna(df[FEATURE_COLS].median())
 
     X = df[FEATURE_COLS]
-    y = np.log1p(df[TARGET_COL])  # Train on log(price) for better distribution
+    y = np.log1p(df[TARGET_COL])
 
     print(f"Training on {len(df)} listings with {len(FEATURE_COLS)} features")
     print(f"  - Base features:    {len(BASE_FEATURES)}")
     print(f"  - Amenity flags:    {len(AMENITY_FEATURE_COLS)}")
     print(f"  - Category scores:  {len(CATEGORY_FEATURE_COLS)}")
 
-    # Stratified split on price bins
     price_bins = pd.cut(y, bins=5, labels=False)
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=price_bins
@@ -317,18 +316,15 @@ def train_model(df):
         verbosity=0,
     )
 
-    # Early stopping to find best iteration
     print("\nFinding optimal n_estimators with early stopping...")
     cv_model = XGBRegressor(n_estimators=3000, early_stopping_rounds=50, **base_params)
     cv_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
     best_n = cv_model.best_iteration + 1
     print(f"  Best n_estimators: {best_n}")
 
-    # Final model
     model = XGBRegressor(n_estimators=best_n, **base_params)
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
-    # Cross-validation
     print("Running 5-fold cross-validation...")
     kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     cv_scores = cross_val_score(
@@ -346,7 +342,6 @@ def evaluate_model(model, X_train, X_test, y_train, y_test):
     y_pred_train_log = model.predict(X_train)
     y_pred_test_log = model.predict(X_test)
 
-    # Convert back to dollar values
     y_train_usd = np.expm1(y_train)
     y_test_usd = np.expm1(y_test)
     y_pred_train_usd = np.expm1(y_pred_train_log)
@@ -369,18 +364,15 @@ def evaluate_model(model, X_train, X_test, y_train, y_test):
     print(f"{'RMSE ($)':<25} {train_rmse:>10.2f} {test_rmse:>10.2f}")
     print(f"{'R² Score':<25} {train_r2:>10.4f} {test_r2:>10.4f}")
 
-    # Percentage error distribution
     pct_errors = np.abs(y_test_usd.values - y_pred_test_usd) / y_test_usd.values * 100
     print(f"\nTest Set % Error Distribution:")
     for thresh in [10, 20, 30, 50]:
         within = (pct_errors <= thresh).sum()
         print(f"  Within {thresh:>2d}%: {within:>5d} / {len(pct_errors)} ({within / len(pct_errors) * 100:.1f}%)")
 
-    # MAPE
     mape = np.mean(pct_errors)
     print(f"\n  MAPE: {mape:.1f}%")
 
-    # Feature importance — top 25
     importance = model.feature_importances_
     feat_imp = sorted(zip(FEATURE_COLS, importance), key=lambda x: x[1], reverse=True)
     print(f"\nTop 25 Feature Importance:")
@@ -390,23 +382,21 @@ def evaluate_model(model, X_train, X_test, y_train, y_test):
 
 
 def build_market_data(df):
-    """
-    Build a market data snapshot used at prediction time for neighbourhood
-    comparisons and revenue optimisation.
-    """
+    """Build a market data snapshot used at prediction time for neighbourhood comparisons."""
     return {
-        'coords': df[['lat', 'lng']].values.astype(np.float32),
-        'prices': df['price'].values.astype(np.float32),
-        'capacities': df['total_capacity'].values.astype(np.float32),
-        'amenity_counts': df['amenity_count'].values.astype(np.float32),
-        'occ_rates': df['occ_rate'].values.astype(np.float32),
+        'coords':        df[['lat', 'lng']].values.astype(np.float32),
+        'prices':        df['price'].values.astype(np.float32),
+        'capacities':    df['total_capacity'].values.astype(np.float32),
+        'amenity_counts':df['amenity_count'].values.astype(np.float32),
+        'occ_rates':     df['occ_rate'].values.astype(np.float32),
     }
 
 
-def save_artifacts(model, le_listing, le_room, df):
+def save_artifacts(model, le_listing, le_room, df, model_dir):
     """Save model, encoders, and market stats to disk."""
-    model_path = os.path.join(MODEL_DIR, 'xgb_price_model.pkl')
-    encoders_path = os.path.join(MODEL_DIR, 'price_model_meta.pkl')
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, 'xgb_price_model.pkl')
+    encoders_path = os.path.join(model_dir, 'price_model_meta.pkl')
 
     with open(model_path, 'wb') as f:
         pickle.dump(model, f)
@@ -418,13 +408,13 @@ def save_artifacts(model, le_listing, le_room, df):
         'top_amenities': TOP_AMENITIES,
         'amenity_categories': AMENITY_CATEGORIES,
         'market_stats': {
-            'center_lat': float(df.attrs.get('center_lat', df['lat'].median())),
-            'center_lng': float(df.attrs.get('center_lng', df['lng'].median())),
+            'center_lat':        float(df.attrs.get('center_lat', df['lat'].median())),
+            'center_lng':        float(df.attrs.get('center_lng', df['lng'].median())),
             'max_amenity_count': int(df.attrs.get('max_amenity_count', df['amenity_count'].max())),
-            'price_median': float(df['price'].median()),
-            'price_mean': float(df['price'].mean()),
-            'price_q25': float(df['price'].quantile(0.25)),
-            'price_q75': float(df['price'].quantile(0.75)),
+            'price_median':      float(df['price'].median()),
+            'price_mean':        float(df['price'].mean()),
+            'price_q25':         float(df['price'].quantile(0.25)),
+            'price_q75':         float(df['price'].quantile(0.75)),
         },
         'market_data': build_market_data(df),
     }
@@ -441,12 +431,20 @@ def save_artifacts(model, le_listing, le_room, df):
 # ==============================================================================
 
 def main():
+    args = parse_args()
+    city = args.city
+
+    sanitized_dir = os.path.join(os.path.dirname(__file__), '..', f'listings-sanitized-{city}')
+    model_dir = os.path.join(os.path.dirname(__file__), '..', 'combined_api', city)
+
     print("=" * 60)
-    print("RENTSIGHT — Optimal Price Predictor Training Pipeline")
+    print(f"RENTSIGHT — Price Predictor Training — {city.upper()}")
     print("=" * 60)
+    print(f"  Data  : {sanitized_dir}")
+    print(f"  Output: {model_dir}")
 
     print("\n[1/4] Loading listings...")
-    df = load_listings()
+    df = load_listings(sanitized_dir)
 
     print("\n[2/4] Engineering features...")
     df, le_listing, le_room = engineer_features(df)
@@ -459,12 +457,12 @@ def main():
     print("\n[4/4] Evaluating...")
     evaluate_model(model, X_train, X_test, y_train, y_test)
 
-    save_artifacts(model, le_listing, le_room, df)
+    save_artifacts(model, le_listing, le_room, df, model_dir)
 
     print("\n" + "=" * 60)
-    print("Training complete!")
+    print(f"Training complete for {city}!")
     print("=" * 60)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

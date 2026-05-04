@@ -1,6 +1,7 @@
 import os
 import json
 import pickle
+import argparse
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split, cross_val_score, KFold
@@ -9,10 +10,25 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
 # ==============================================================================
-# CONFIG
+# CLI
 # ==============================================================================
-SANITIZED_DIR = os.path.join(os.path.dirname(__file__), '..', 'listings-sanitized')
-MODEL_DIR = os.path.dirname(__file__)
+
+VALID_CITIES = ['islamabad', 'lahore', 'karachi']
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train the occupancy-rate predictor for a city.')
+    parser.add_argument(
+        '--city',
+        choices=VALID_CITIES,
+        default='islamabad',
+        help='City dataset to train on (default: islamabad)',
+    )
+    return parser.parse_args()
+
+# ==============================================================================
+# CONFIG  (resolved at runtime based on --city)
+# ==============================================================================
+
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 
@@ -20,7 +36,6 @@ TEST_SIZE = 0.2
 # AMENITY DEFINITIONS
 # ==============================================================================
 
-# Top amenities used as individual binary features (appearing in 100+ listings)
 TOP_AMENITIES = [
     'Wifi', 'Kitchen', 'Free parking on premises', 'TV', 'Air conditioning',
     'Fire extinguisher', 'Dedicated workspace', 'First aid kit', 'Washer',
@@ -41,7 +56,6 @@ TOP_AMENITIES = [
     'Indoor fireplace', 'Fire pit', 'Dryer', 'Blender', 'Pool',
 ]
 
-# Amenity categories for aggregate features
 AMENITY_CATEGORIES = {
     'safety': [
         'Fire extinguisher', 'First aid kit', 'Smoke alarm',
@@ -97,14 +111,14 @@ AMENITY_CATEGORIES = {
 # DATA LOADING
 # ==============================================================================
 
-def load_listings():
+def load_listings(sanitized_dir):
     """Load all sanitized listings into a pandas DataFrame."""
     records = []
-    for filename in os.listdir(SANITIZED_DIR):
+    for filename in os.listdir(sanitized_dir):
         if not filename.endswith('.json'):
             continue
         try:
-            with open(os.path.join(SANITIZED_DIR, filename), 'r', encoding='utf-8') as f:
+            with open(os.path.join(sanitized_dir, filename), 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
             location = data.get('location') or {}
@@ -124,11 +138,9 @@ def load_listings():
                 'amenity_count': len(amenities),
             }
 
-            # Binary flags for top amenities
             for am in TOP_AMENITIES:
                 record[f'am_{am}'] = int(am in amenities)
 
-            # Category counts
             for cat, keywords in AMENITY_CATEGORIES.items():
                 record[f'cat_{cat}'] = sum(1 for k in keywords if k in amenities)
 
@@ -147,7 +159,6 @@ def load_listings():
 def compute_neighborhood_stats(df):
     """
     For each listing, compute stats of nearby listings within ~1km radius.
-    Captures neighborhood-level market signals.
     """
     from scipy.spatial import cKDTree
 
@@ -193,22 +204,10 @@ def compute_neighborhood_stats(df):
 
 
 def engineer_features(df):
-    """
-    Create features from raw listing data.
-
-    Groups:
-      1. Ratio features    — value metrics per guest/bedroom
-      2. Size features     — total capacity, size category
-      3. Price features    — log price, price bins
-      4. Location features — distance from center, lat/lng interactions
-      5. Neighborhood      — competitor density, local comparisons
-      6. Categorical       — label-encoded types + flags
-      7. Amenity features  — binary flags, counts, category scores, derived ratios
-    """
+    """Create all features from raw listing data."""
     bedrooms = df['bedrooms'].clip(lower=1)
     max_guests = df['max_guests'].clip(lower=1)
 
-    # --- 1. Ratio features ---
     df['price_per_guest'] = df['price'] / max_guests
     df['price_per_bedroom'] = df['price'] / bedrooms
     df['price_per_bed'] = df['price'] / df['beds'].clip(lower=1)
@@ -217,13 +216,11 @@ def engineer_features(df):
     df['baths_per_bedroom'] = df['baths'] / bedrooms
     df['beds_to_guests'] = df['beds'] / max_guests
 
-    # --- 2. Size features ---
     df['total_capacity_raw'] = df['bedrooms'] + df['beds'] + df['baths']
     df['total_capacity'] = df['total_capacity_raw']
     df['size_score'] = df['bedrooms'] * 2 + df['beds'] + df['baths'] * 1.5
     df['is_sweet_spot'] = ((df['bedrooms'].between(2, 3)) & (df['max_guests'].between(4, 6))).astype(int)
 
-    # --- 3. Price features ---
     df['log_price'] = np.log1p(df['price'])
     df['price_squared'] = df['price'] ** 2
     price_median = df['price'].median()
@@ -235,16 +232,13 @@ def engineer_features(df):
         labels=[0, 1, 2, 3]
     ).astype(float)
 
-    # --- 4. Location features ---
     center_lat = df['lat'].median()
     center_lng = df['lng'].median()
     df['dist_from_center'] = np.sqrt((df['lat'] - center_lat)**2 + (df['lng'] - center_lng)**2)
     df['lat_lng_interaction'] = df['lat'] * df['lng']
 
-    # --- 5. Neighborhood features ---
     df = compute_neighborhood_stats(df)
 
-    # --- 6. Categorical encoding ---
     le_listing = LabelEncoder()
     le_room = LabelEncoder()
     df['listing_type_enc'] = le_listing.fit_transform(df['listing_type'].fillna('Unknown'))
@@ -252,13 +246,11 @@ def engineer_features(df):
     df['is_entire'] = df['listing_type'].str.lower().str.contains('entire', na=False).astype(int)
     df['is_room'] = df['listing_type'].str.lower().str.contains('room', na=False).astype(int)
 
-    # --- 7. Amenity-derived features ---
     df['amenity_richness'] = df['amenity_count'] / df['amenity_count'].max()
     df['amenity_per_guest'] = df['amenity_count'] / max_guests
     df['amenity_per_bedroom'] = df['amenity_count'] / bedrooms
     df['amenity_per_price'] = df['amenity_count'] / df['price'].clip(lower=1)
 
-    # Store stats for prediction-time use
     df.attrs['price_q25'] = price_q25
     df.attrs['price_median'] = price_median
     df.attrs['price_q75'] = price_q75
@@ -273,24 +265,16 @@ def engineer_features(df):
 # ==============================================================================
 
 BASE_FEATURES = [
-    # Raw
     'price', 'max_guests', 'bedrooms', 'beds', 'baths', 'lat', 'lng',
-    # Categorical
     'listing_type_enc', 'room_type_enc', 'is_entire', 'is_room',
-    # Ratios
     'price_per_guest', 'price_per_bedroom', 'price_per_bed',
     'guests_per_bedroom', 'beds_per_bedroom', 'baths_per_bedroom', 'beds_to_guests',
-    # Size
     'total_capacity', 'size_score', 'is_sweet_spot',
-    # Price derived
     'log_price', 'price_squared', 'price_tier',
-    # Location derived
     'dist_from_center', 'lat_lng_interaction',
-    # Neighborhood
     'neighbor_count', 'neighbor_avg_price', 'neighbor_avg_capacity',
     'neighbor_price_rank', 'price_vs_neighborhood',
     'neighbor_avg_amenities', 'amenities_vs_neighborhood',
-    # Amenity aggregate
     'amenity_count', 'amenity_richness', 'amenity_per_guest',
     'amenity_per_bedroom', 'amenity_per_price',
 ]
@@ -330,7 +314,7 @@ def train_model(df):
         max_depth=7,
         learning_rate=0.03,
         subsample=0.75,
-        colsample_bytree=0.55,   # lower — forces selection among many amenity features
+        colsample_bytree=0.55,
         colsample_bylevel=0.55,
         min_child_weight=5,
         reg_alpha=1.0,
@@ -341,17 +325,14 @@ def train_model(df):
         verbosity=0,
     )
 
-    # Find best n_estimators via early stopping
     cv_model = XGBRegressor(n_estimators=2000, early_stopping_rounds=50, **base_params)
     cv_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
     best_n = cv_model.best_iteration + 1
     print(f"  Best n_estimators: {best_n}")
 
-    # Train final model
     model = XGBRegressor(n_estimators=best_n, **base_params)
     model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
-    # Cross-validation score
     kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     cv_scores = cross_val_score(
         XGBRegressor(n_estimators=best_n, **base_params),
@@ -385,7 +366,6 @@ def evaluate_model(model, X_train, X_test, y_train, y_test):
     print(f"  Within 15%: {(errors <= 15).sum():>5d} / {len(errors)} ({(errors <= 15).mean()*100:.1f}%)")
     print(f"  Within 20%: {(errors <= 20).sum():>5d} / {len(errors)} ({(errors <= 20).mean()*100:.1f}%)")
 
-    # Feature importance — top 25
     importance = model.feature_importances_
     feat_imp = sorted(zip(FEATURE_COLS, importance), key=lambda x: x[1], reverse=True)
     print(f"\nTop 25 Feature Importance:")
@@ -393,7 +373,6 @@ def evaluate_model(model, X_train, X_test, y_train, y_test):
         bar = '█' * int(imp * 50)
         print(f"  {name:<30s} {imp:.4f}  {bar}")
 
-    # Show amenity-related features specifically
     am_features = [(n, i) for n, i in feat_imp if n.startswith('am_') or n.startswith('cat_') or 'amenity' in n]
     print(f"\nAmenity-Related Feature Importance (top 15):")
     for name, imp in am_features[:15]:
@@ -401,10 +380,22 @@ def evaluate_model(model, X_train, X_test, y_train, y_test):
         print(f"  {name:<30s} {imp:.4f}  {bar}")
 
 
-def save_artifacts(model, le_listing, le_room, df):
+def build_market_data(df):
+    """Build a market data snapshot used at prediction time for neighbourhood comparisons."""
+    return {
+        'coords':        df[['lat', 'lng']].values.astype(np.float32),
+        'prices':        df['price'].values.astype(np.float32),
+        'capacities':    df['total_capacity_raw'].values.astype(np.float32),
+        'amenity_counts':df['amenity_count'].values.astype(np.float32),
+        'occ_rates':     df['occ_rate'].values.astype(np.float32),
+    }
+
+
+def save_artifacts(model, le_listing, le_room, df, model_dir):
     """Save model, encoders, and market stats to disk."""
-    model_path = os.path.join(MODEL_DIR, 'xgb_occupancy_model.pkl')
-    encoders_path = os.path.join(MODEL_DIR, 'label_encoders.pkl')
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, 'xgb_occupancy_model.pkl')
+    encoders_path = os.path.join(model_dir, 'label_encoders.pkl')
 
     with open(model_path, 'wb') as f:
         pickle.dump(model, f)
@@ -417,30 +408,38 @@ def save_artifacts(model, le_listing, le_room, df):
             'top_amenities': TOP_AMENITIES,
             'amenity_categories': AMENITY_CATEGORIES,
             'market_stats': {
-                'price_q25': float(df.attrs.get('price_q25', df['price'].quantile(0.25))),
-                'price_median': float(df.attrs.get('price_median', df['price'].median())),
-                'price_q75': float(df.attrs.get('price_q75', df['price'].quantile(0.75))),
-                'center_lat': float(df.attrs.get('center_lat', df['lat'].median())),
-                'center_lng': float(df.attrs.get('center_lng', df['lng'].median())),
+                'price_q25':         float(df.attrs.get('price_q25', df['price'].quantile(0.25))),
+                'price_median':      float(df.attrs.get('price_median', df['price'].median())),
+                'price_q75':         float(df.attrs.get('price_q75', df['price'].quantile(0.75))),
+                'center_lat':        float(df.attrs.get('center_lat', df['lat'].median())),
+                'center_lng':        float(df.attrs.get('center_lng', df['lng'].median())),
                 'max_amenity_count': int(df.attrs.get('max_amenity_count', df['amenity_count'].max())),
-            }
+            },
+            'market_data': build_market_data(df),
         }, f)
 
-    print(f"\nModel saved to: {model_path}")
+    print(f"\nModel saved to:    {model_path}")
     print(f"Encoders saved to: {encoders_path}")
-
 
 # ==============================================================================
 # MAIN
 # ==============================================================================
 
 def main():
+    args = parse_args()
+    city = args.city
+
+    sanitized_dir = os.path.join(os.path.dirname(__file__), '..', f'listings-sanitized-{city}')
+    model_dir = os.path.join(os.path.dirname(__file__), '..', 'combined_api', city)
+
     print("=" * 60)
-    print("OCCUPANCY RATE PREDICTOR — Training Pipeline (v2 + Amenities)")
+    print(f"OCCUPANCY RATE PREDICTOR — {city.upper()}")
     print("=" * 60)
+    print(f"  Data : {sanitized_dir}")
+    print(f"  Output: {model_dir}")
 
     print("\n[1/4] Loading listings...")
-    df = load_listings()
+    df = load_listings(sanitized_dir)
 
     print("\n[2/4] Engineering features...")
     df, le_listing, le_room = engineer_features(df)
@@ -453,12 +452,12 @@ def main():
     print("\n[4/4] Evaluating...")
     evaluate_model(model, X_train, X_test, y_train, y_test)
 
-    save_artifacts(model, le_listing, le_room, df)
+    save_artifacts(model, le_listing, le_room, df, model_dir)
 
     print("\n" + "=" * 60)
-    print("Training complete!")
+    print(f"Training complete for {city}!")
     print("=" * 60)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
