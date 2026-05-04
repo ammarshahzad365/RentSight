@@ -377,7 +377,7 @@ def evaluate_model(model, X_train, X_test, y_train, y_test):
     feat_imp = sorted(zip(FEATURE_COLS, importance), key=lambda x: x[1], reverse=True)
     print(f"\nTop 25 Feature Importance:")
     for name, imp in feat_imp[:25]:
-        bar = '█' * int(imp * 50)
+        bar = '#' * int(imp * 50)
         print(f"  {name:<30s} {imp:.4f}  {bar}")
 
 

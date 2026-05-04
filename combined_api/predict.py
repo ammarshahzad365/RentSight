@@ -1,22 +1,25 @@
 """
 RentSight Combined API — Prediction Module
 ============================================
-Unified prediction interface that wraps both the **occupancy predictor** and
-the **price predictor** into a single module.
+Unified prediction interface for all three cities (Islamabad, Lahore, Karachi).
 
-Two primary workflows:
+Models for each city are loaded from:
+    combined_api/{city}/xgb_price_model.pkl
+    combined_api/{city}/price_model_meta.pkl
+    combined_api/{city}/xgb_occupancy_model.pkl
+    combined_api/{city}/label_encoders.pkl
 
-1. **Price provided**     → predict occupancy at that price, then derive
-                            revenue / positioning metrics.
-2. **Price NOT provided** → predict market & optimal prices first, then
-                            predict occupancy at those prices, then derive
-                            revenue / positioning metrics.
+Two primary workflows per city:
+
+1. Price provided     → predict occupancy at that price, derive revenue metrics.
+2. Price NOT provided → predict market & optimal prices first, then occupancy,
+                        then derive revenue metrics.
 
 Usage:
     from predict import load_all_models, predict_with_price, predict_without_price
-    models = load_all_models()
-    result = predict_with_price(listing, models)
-    result = predict_without_price(listing, models)
+    all_models = load_all_models()
+    result = predict_with_price(listing, all_models['islamabad'])
+    result = predict_without_price(listing, all_models['lahore'])
 """
 
 import os
@@ -25,42 +28,65 @@ import numpy as np
 import pandas as pd
 
 # ==============================================================================
-# PATHS — all models live in this directory
+# PATHS
 # ==============================================================================
 
 MODEL_DIR = os.path.dirname(__file__)
+CITIES = ['islamabad', 'lahore', 'karachi']
 
 
 # ==============================================================================
 # MODEL LOADING
 # ==============================================================================
 
-def load_all_models() -> dict:
+def load_city_models(city: str) -> dict:
     """
-    Load all artefacts from both predictors.
+    Load all artefacts for one city from combined_api/{city}/.
 
     Returns a dict with:
-        price_model, price_meta          — XGBoost price model + metadata
-        occ_model, occ_encoders          — XGBoost occupancy model + metadata
+        price_model, price_meta   — XGBoost price model + metadata
+        occ_model, occ_encoders   — XGBoost occupancy model + encoders
     """
-    # --- Price model ---
-    with open(os.path.join(MODEL_DIR, 'xgb_price_model.pkl'), 'rb') as f:
-        price_model = pickle.load(f)
-    with open(os.path.join(MODEL_DIR, 'price_model_meta.pkl'), 'rb') as f:
-        price_meta = pickle.load(f)
+    city_dir = os.path.join(MODEL_DIR, city)
 
-    # --- Occupancy model ---
-    with open(os.path.join(MODEL_DIR, 'xgb_occupancy_model.pkl'), 'rb') as f:
+    with open(os.path.join(city_dir, 'xgb_price_model.pkl'), 'rb') as f:
+        price_model = pickle.load(f)
+    with open(os.path.join(city_dir, 'price_model_meta.pkl'), 'rb') as f:
+        price_meta = pickle.load(f)
+    with open(os.path.join(city_dir, 'xgb_occupancy_model.pkl'), 'rb') as f:
         occ_model = pickle.load(f)
-    with open(os.path.join(MODEL_DIR, 'label_encoders.pkl'), 'rb') as f:
+    with open(os.path.join(city_dir, 'label_encoders.pkl'), 'rb') as f:
         occ_encoders = pickle.load(f)
 
     return {
         'price_model': price_model,
-        'price_meta': price_meta,
-        'occ_model': occ_model,
-        'occ_encoders': occ_encoders,
+        'price_meta':  price_meta,
+        'occ_model':   occ_model,
+        'occ_encoders':occ_encoders,
     }
+
+
+def load_all_models() -> dict:
+    """
+    Load models for all cities.
+
+    Returns a dict keyed by city name, e.g.:
+        {
+            'islamabad': { price_model, price_meta, occ_model, occ_encoders },
+            'lahore':    { ... },
+            'karachi':   { ... },
+        }
+
+    Cities whose model files are missing are skipped with a warning.
+    """
+    all_models = {}
+    for city in CITIES:
+        try:
+            all_models[city] = load_city_models(city)
+            print(f"  Loaded models for {city}")
+        except FileNotFoundError as e:
+            print(f"  Warning: models for '{city}' not found — {e}")
+    return all_models
 
 
 # ==============================================================================
@@ -80,7 +106,6 @@ def _build_price_features(listing: dict, meta: dict) -> pd.DataFrame:
     location = listing.get('location') or {}
     amenities = set(listing.get('amenities') or [])
 
-    # --- Categoricals ---
     lt = listing.get('listing_type', 'Unknown')
     try:
         lt_enc = le_listing.transform([lt])[0]
@@ -93,7 +118,6 @@ def _build_price_features(listing: dict, meta: dict) -> pd.DataFrame:
     except ValueError:
         rt_enc = 0
 
-    # --- Raw values ---
     max_guests = max(listing.get('max_guests', 1) or 1, 1)
     bedrooms = max(listing.get('bedrooms', 1) or 1, 1)
     beds = max(listing.get('beds', 1) or 1, 1)
@@ -104,7 +128,6 @@ def _build_price_features(listing: dict, meta: dict) -> pd.DataFrame:
     total_cap = bedrooms + beds + baths
     amenity_count = len(amenities)
 
-    # --- Neighborhood (structural features only) ---
     dists = np.sqrt(
         (market['coords'][:, 0] - lat) ** 2 + (market['coords'][:, 1] - lng) ** 2
     )
@@ -119,10 +142,8 @@ def _build_price_features(listing: dict, meta: dict) -> pd.DataFrame:
 
     max_amenity_count = market_stats.get('max_amenity_count', 50)
 
-    # --- Amenity binary flags ---
     amenity_flags = {f'am_{am}': int(am in amenities) for am in top_amenities}
 
-    # --- Category counts ---
     category_counts = {}
     for cat, keywords in amenity_categories.items():
         category_counts[f'cat_{cat}'] = sum(1 for k in keywords if k in amenities)
@@ -181,7 +202,6 @@ def _build_occupancy_features(listing: dict, encoders: dict) -> pd.DataFrame:
     location = listing.get('location') or {}
     amenities = set(listing.get('amenities') or [])
 
-    # --- Encode categoricals ---
     lt = listing.get('listing_type', 'Unknown')
     try:
         lt_enc = le_listing.transform([lt])[0]
@@ -194,7 +214,6 @@ def _build_occupancy_features(listing: dict, encoders: dict) -> pd.DataFrame:
     except ValueError:
         rt_enc = 0
 
-    # --- Raw values ---
     price = listing.get('price', 0) or 0
     max_guests = max(listing.get('max_guests', 1) or 1, 1)
     bedrooms = max(listing.get('bedrooms', 1) or 1, 1)
@@ -206,7 +225,6 @@ def _build_occupancy_features(listing: dict, encoders: dict) -> pd.DataFrame:
     total_cap = bedrooms + beds + baths
     amenity_count = len(amenities)
 
-    # --- Neighborhood stats ---
     dists = np.sqrt(
         (market['coords'][:, 0] - lat) ** 2 + (market['coords'][:, 1] - lng) ** 2
     )
@@ -223,7 +241,6 @@ def _build_occupancy_features(listing: dict, encoders: dict) -> pd.DataFrame:
         n_price_rank = 0.5
         n_avg_amenities = max(amenity_count, 1)
 
-    # --- Price tier ---
     if price <= market_stats['price_q25']:
         price_tier = 0.0
     elif price <= market_stats['price_median']:
@@ -233,10 +250,8 @@ def _build_occupancy_features(listing: dict, encoders: dict) -> pd.DataFrame:
     else:
         price_tier = 3.0
 
-    # --- Amenity binary flags ---
     amenity_flags = {f'am_{am}': int(am in amenities) for am in top_amenities}
 
-    # --- Amenity category counts ---
     category_counts = {}
     for cat, keywords in amenity_categories.items():
         category_counts[f'cat_{cat}'] = sum(1 for k in keywords if k in amenities)
@@ -314,10 +329,7 @@ def _predict_occupancy(listing: dict, price: float, models: dict) -> float:
 
 
 def _get_neighborhood_prices(listing: dict, models: dict) -> dict:
-    """
-    Find comparable listings in the same neighbourhood and return
-    price statistics for context.
-    """
+    """Find comparable listings in the same neighbourhood and return price statistics."""
     market = models['price_meta']['market_data']
     location = listing.get('location') or {}
     lat = location.get('lat', models['price_meta']['market_stats']['center_lat'])
@@ -327,7 +339,6 @@ def _get_neighborhood_prices(listing: dict, models: dict) -> dict:
         (market['coords'][:, 0] - lat) ** 2 + (market['coords'][:, 1] - lng) ** 2
     )
 
-    # Try ~1 km radius first, expand if too few comparables
     for radius in [0.01, 0.02, 0.05]:
         nearby_mask = dists < radius
         if nearby_mask.sum() >= 5:
@@ -340,12 +351,12 @@ def _get_neighborhood_prices(listing: dict, models: dict) -> dict:
 
     return {
         'comparable_count': int(len(nearby_prices)),
-        'min': round(float(np.min(nearby_prices)), 2),
-        'q25': round(float(np.percentile(nearby_prices, 25)), 2),
+        'min':    round(float(np.min(nearby_prices)), 2),
+        'q25':    round(float(np.percentile(nearby_prices, 25)), 2),
         'median': round(float(np.median(nearby_prices)), 2),
-        'q75': round(float(np.percentile(nearby_prices, 75)), 2),
-        'max': round(float(np.max(nearby_prices)), 2),
-        'mean': round(float(np.mean(nearby_prices)), 2),
+        'q75':    round(float(np.percentile(nearby_prices, 75)), 2),
+        'max':    round(float(np.max(nearby_prices)), 2),
+        'mean':   round(float(np.mean(nearby_prices)), 2),
     }
 
 
@@ -359,7 +370,6 @@ def _compute_price_sensitivity(listing: dict, models: dict) -> float:
 
     Higher beta = more price-sensitive (budget/standard listings).
     Lower beta  = less price-sensitive (premium/luxury listings).
-
     Range: 0.5 (luxury) → 1.2 (budget).
     """
     amenities = set(listing.get('amenities') or [])
@@ -401,26 +411,19 @@ def _estimate_occupancy_at_price(price: float, base_occupancy: float,
     return float(np.clip(occ, 3.0, 95.0))
 
 
-def _find_optimal_price(listing: dict, models: dict,
-                        steps: int = 100) -> dict:
+def _find_optimal_price(listing: dict, models: dict, steps: int = 100) -> dict:
     """
     Sweep price points and find the one that maximises estimated monthly
     revenue = price × (occupancy_rate / 100) × 30.
     """
     market_price = _predict_market_price(listing, models)
     neighborhood = _get_neighborhood_prices(listing, models)
-
-    # Base occupancy at market price (from the occupancy model)
     base_occupancy = _predict_occupancy(listing, market_price, models)
-
-    # Price sensitivity
     beta = _compute_price_sensitivity(listing, models)
 
-    # Search range
     price_low = max(market_price * 0.4, 3.0)
     price_high = max(market_price * 3.5, neighborhood['q75'] * 2.5)
 
-    # Sweep
     prices = np.linspace(price_low, price_high, steps)
     results = []
     for p in prices:
@@ -446,19 +449,13 @@ def _find_optimal_price(listing: dict, models: dict,
 
 
 # ==============================================================================
-# DERIVED FIELDS  (computed once we have both price & occupancy)
+# DERIVED FIELDS
 # ==============================================================================
 
 def _compute_derived_fields(price: float, occupancy: float,
                             listing: dict, models: dict) -> dict:
     """
-    Given a final price and occupancy rate, produce all derived metrics:
-      - expected monthly revenue
-      - expected annual revenue
-      - daily earnings estimate
-      - price positioning vs market & neighbourhood
-      - booked nights per month / year
-      - human-readable recommendation
+    Given a final price and occupancy rate, produce all derived metrics.
     """
     neighborhood = _get_neighborhood_prices(listing, models)
     market_price = _predict_market_price(listing, models)
@@ -469,7 +466,6 @@ def _compute_derived_fields(price: float, occupancy: float,
     annual_revenue = round(price * booked_nights_year, 2)
     daily_earnings = round(monthly_revenue / 30, 2)
 
-    # Positioning
     if price > market_price * 1.15:
         positioning = "above market rate (premium positioning)"
     elif price < market_price * 0.85:
@@ -477,9 +473,8 @@ def _compute_derived_fields(price: float, occupancy: float,
     else:
         positioning = "at market rate"
 
-    # Price range recommendation (±15% of given price)
     price_range = {
-        'low': round(price * 0.85, 2),
+        'low':  round(price * 0.85, 2),
         'high': round(price * 1.15, 2),
     }
 
@@ -513,34 +508,15 @@ def _compute_derived_fields(price: float, occupancy: float,
 
 def predict_with_price(listing: dict, models: dict) -> dict:
     """
-    When the user provides a price along with all listing fields:
+    When the user provides a price:
       1. Predict occupancy at that exact price.
       2. Compute all derived revenue / positioning metrics.
-
-    Args:
-        listing: dict with keys:
-            price, max_guests, bedrooms, beds, baths,
-            listing_type, room_type,
-            location: {lat, lng},
-            amenities: [str, ...]
-        models: dict from load_all_models()
-
-    Returns:
-        dict with occupancy_rate, revenue metrics, neighbourhood stats,
-        positioning, and recommendation.
     """
     price = listing['price']
-
-    # Step 1: predict occupancy at the given price
     occupancy = _predict_occupancy(listing, price, models)
-
-    # Step 2: derive all fields from price + occupancy
     result = _compute_derived_fields(price, occupancy, listing, models)
-
-    # Remove fields not needed for this endpoint
     result.pop('neighborhood', None)
     result.pop('price_range', None)
-
     return result
 
 
@@ -554,41 +530,21 @@ def predict_without_price(listing: dict, models: dict) -> dict:
       1. Predict market & optimal price.
       2. Predict occupancy at the optimal price.
       3. Compute all derived revenue / positioning metrics.
-
-    Args:
-        listing: dict with keys:
-            max_guests, bedrooms, beds, baths,
-            listing_type, room_type,
-            location: {lat, lng},
-            amenities: [str, ...]
-        models: dict from load_all_models()
-
-    Returns:
-        dict with optimal_price, market_price, occupancy, revenue metrics,
-        neighbourhood stats, positioning, and recommendation.
     """
-    # Step 1: find best price
     optimization = _find_optimal_price(listing, models)
-
     optimal_price = optimization['optimal_price']
     market_price = optimization['market_price']
 
-    # Step 2: predict occupancy at optimal price using the occupancy model
     occupancy_at_optimal = _predict_occupancy(listing, optimal_price, models)
-
-    # Also predict occupancy at market price for comparison
     occupancy_at_market = _predict_occupancy(listing, market_price, models)
 
-    # Step 3: derive all fields using optimal price + occupancy
     result = _compute_derived_fields(optimal_price, occupancy_at_optimal, listing, models)
 
-    # Add price-prediction-specific extras
     result['optimal_price'] = optimal_price
     result['occupancy_at_market_price'] = occupancy_at_market
     result['price_sensitivity'] = optimization['price_sensitivity']
     result['amenity_count'] = len(listing.get('amenities') or [])
 
-    # Market-price comparison block
     market_booked = round(30 * (occupancy_at_market / 100), 1)
     market_monthly_rev = round(market_price * market_booked, 2)
     result['market_price_analysis'] = {
@@ -599,51 +555,3 @@ def predict_without_price(listing: dict, models: dict) -> dict:
     }
 
     return result
-
-
-# ==============================================================================
-# INTERACTIVE DEMO
-# ==============================================================================
-
-if __name__ == "__main__":
-    print("Loading all models...")
-    models = load_all_models()
-    print("Models loaded!\n")
-
-    sample = {
-        "max_guests": 4,
-        "bedrooms": 2,
-        "beds": 2,
-        "baths": 1,
-        "listing_type": "Entire rental unit",
-        "room_type": "Entire rental unit",
-        "location": {"lat": 33.65, "lng": 73.06},
-        "amenities": [
-            "Wifi", "Kitchen", "Air conditioning", "TV",
-            "Free parking on premises", "Washer", "Essentials", "Hot water",
-        ],
-    }
-
-    print("=" * 60)
-    print("  Scenario 1: Price NOT provided")
-    print("=" * 60)
-    r1 = predict_without_price(sample, models)
-    print(f"  Market price:        ${r1['market_price']:.2f}/night")
-    print(f"  Optimal price:       ${r1['optimal_price']:.2f}/night")
-    print(f"  Occupancy:           {r1['occupancy_rate']:.0f}%")
-    print(f"  Monthly revenue:     ${r1['monthly_revenue']:,.0f}")
-    print(f"  Annual revenue:      ${r1['annual_revenue']:,.0f}")
-    print(f"  >> {r1['recommendation']}")
-
-    print()
-
-    sample_with_price = {**sample, "price": 35.0}
-    print("=" * 60)
-    print("  Scenario 2: Price PROVIDED ($35)")
-    print("=" * 60)
-    r2 = predict_with_price(sample_with_price, models)
-    print(f"  Price:               ${r2['price']:.2f}/night")
-    print(f"  Occupancy:           {r2['occupancy_rate']:.0f}%")
-    print(f"  Monthly revenue:     ${r2['monthly_revenue']:,.0f}")
-    print(f"  Annual revenue:      ${r2['annual_revenue']:,.0f}")
-    print(f"  >> {r2['recommendation']}")

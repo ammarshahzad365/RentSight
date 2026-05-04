@@ -54,7 +54,7 @@ def main():
     for script_name, description in pipeline_steps:
         run_script(script_name, description, city)
 
-    print(f'\n✓ Sanitization pipeline for {city} completed successfully!')
+    print(f'\nSanitization pipeline for {city} completed successfully!')
     print(f'  Next step: python add_occupancy_rate.py --city {city}')
 
 

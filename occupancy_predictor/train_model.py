@@ -370,13 +370,13 @@ def evaluate_model(model, X_train, X_test, y_train, y_test):
     feat_imp = sorted(zip(FEATURE_COLS, importance), key=lambda x: x[1], reverse=True)
     print(f"\nTop 25 Feature Importance:")
     for name, imp in feat_imp[:25]:
-        bar = '█' * int(imp * 50)
+        bar = '#' * int(imp * 50)
         print(f"  {name:<30s} {imp:.4f}  {bar}")
 
     am_features = [(n, i) for n, i in feat_imp if n.startswith('am_') or n.startswith('cat_') or 'amenity' in n]
     print(f"\nAmenity-Related Feature Importance (top 15):")
     for name, imp in am_features[:15]:
-        bar = '█' * int(imp * 100)
+        bar = '#' * int(imp * 100)
         print(f"  {name:<30s} {imp:.4f}  {bar}")
 
 

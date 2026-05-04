@@ -15,8 +15,7 @@ def process_price(data, filename):
     """Process price field in listing data."""
     if 'price' in data:
         price_val = extract_price(str(data['price']))
-        if price_val is not None:
-            data['price'] = price_val
+        data['price'] = price_val  # None if unparseable — downstream treats as missing
     return data
 
 if __name__ == "__main__":
