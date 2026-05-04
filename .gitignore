@@ -1,6 +1,7 @@
 data/
 *.json
-listings/
+.cursor
+listings*
 listings-sanitized/
 __pycache__/
 listings-sanitized.zip
