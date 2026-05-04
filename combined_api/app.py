@@ -14,7 +14,7 @@ Endpoints:
 from fastapi import FastAPI, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Literal
 from predict import load_all_models, predict_with_price, predict_without_price
 
 # ==============================================================================
@@ -23,14 +23,81 @@ from predict import load_all_models, predict_with_price, predict_without_price
 
 CityType = Literal['islamabad', 'lahore', 'karachi']
 
+_DESCRIPTION = """
+## Overview
+
+RentSight is a machine-learning API for short-term rental (Airbnb) analytics across **Islamabad**, **Lahore**, and **Karachi**.
+
+It exposes two core prediction workflows per city:
+
+| Workflow | Endpoint | When to use |
+|----------|----------|-------------|
+| Price known | `POST /{city}/predict` | Host has a price in mind — get expected occupancy & revenue |
+| Price unknown | `POST /{city}/predict-price` | Host wants a data-driven price recommendation + revenue forecast |
+
+---
+
+## How the models work
+
+Each city has **two independently trained XGBoost models**:
+
+- **Price model** — predicts the market-rate nightly price from listing features (room type, capacity, location, amenities). Trained on log-price to handle price skew.
+- **Occupancy model** — predicts the occupancy rate (%) using price, listing features, neighborhood context, and amenity signals.
+
+Both models are trained on sanitized, city-specific Airbnb listing data.
+
+---
+
+## Cities
+
+| City | Path prefix |
+|------|-------------|
+| Islamabad | `/islamabad/...` |
+| Lahore | `/lahore/...` |
+| Karachi | `/karachi/...` |
+
+---
+
+## Common fields
+
+**`listing_type`** accepted values (case-sensitive):
+`Entire rental unit`, `Entire home`, `Entire condo`, `Entire serviced apartment`,
+`Private room`, `Private room in home`, `Shared room`, `Room in hotel`
+
+**`room_type`** accepted values:
+`Entire home/apt`, `Entire rental unit`, `Private room`, `Shared room`, `Hotel room`
+
+**`amenities`** — use the exact names returned by `GET /{city}/amenities`.
+Unrecognised names are silently ignored.
+"""
+
+_TAGS = [
+    {
+        "name": "Prediction",
+        "description": "Core prediction endpoints. One for when price is known, one for when it is not.",
+    },
+    {
+        "name": "Reference",
+        "description": "Lookup endpoints — cities available, recognised amenity names.",
+    },
+    {
+        "name": "Health",
+        "description": "Service health check.",
+    },
+]
+
 app = FastAPI(
     title="RentSight Combined API",
-    description=(
-        "Unified API for Airbnb listing analysis across Islamabad, Lahore, and Karachi. "
-        "Predicts occupancy when price is known, or finds the optimal price "
-        "and then predicts occupancy — returning full revenue analytics in both cases."
-    ),
+    description=_DESCRIPTION,
     version="2.0.0",
+    openapi_tags=_TAGS,
+    contact={
+        "name": "RentSight",
+        "email": "munim@iclosed.io",
+    },
+    license_info={
+        "name": "MIT",
+    },
 )
 
 app.add_middleware(
@@ -59,7 +126,7 @@ def _get_city_models(city: str) -> dict:
     if city not in all_city_models:
         raise HTTPException(
             status_code=503,
-            detail=f"Models for '{city}' are not available. Check that training has been run for this city.",
+            detail=f"Models for '{city}' are not available. Ensure training has been run for this city.",
         )
     return all_city_models[city]
 
@@ -69,23 +136,33 @@ def _get_city_models(city: str) -> dict:
 # ==============================================================================
 
 class Location(BaseModel):
-    lat: float = Field(..., description="Latitude",  examples=[33.65])
-    lng: float = Field(..., description="Longitude", examples=[73.04])
+    lat: float = Field(..., description="Latitude (decimal degrees)", examples=[33.65])
+    lng: float = Field(..., description="Longitude (decimal degrees)", examples=[73.04])
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"lat": 33.65, "lng": 73.06},
+            ]
+        }
+    }
 
 
 class NeighborhoodStats(BaseModel):
-    comparable_count: int
-    min:    float
-    q25:    float
-    median: float
-    q75:    float
-    max:    float
-    mean:   float
+    """Price statistics for comparable listings within ~1 km of the given location."""
+    comparable_count: int   = Field(..., description="Number of comparable listings found nearby")
+    min:    float           = Field(..., description="Lowest price among comparable listings ($/night)")
+    q25:    float           = Field(..., description="25th percentile price ($/night)")
+    median: float           = Field(..., description="Median price ($/night)")
+    q75:    float           = Field(..., description="75th percentile price ($/night)")
+    max:    float           = Field(..., description="Highest price among comparable listings ($/night)")
+    mean:   float           = Field(..., description="Average price among comparable listings ($/night)")
 
 
 class PriceRange(BaseModel):
-    low:  float
-    high: float
+    """Recommended pricing bracket around the optimal price."""
+    low:  float = Field(..., description="Lower bound — 15% below optimal price ($/night)")
+    high: float = Field(..., description="Upper bound — 15% above optimal price ($/night)")
 
 
 # ==============================================================================
@@ -93,60 +170,147 @@ class PriceRange(BaseModel):
 # ==============================================================================
 
 class PredictWithPriceRequest(BaseModel):
-    """All listing fields INCLUDING price."""
-    price: float = Field(..., gt=0, description="Nightly price in USD", examples=[35.0])
-    max_guests: int = Field(..., ge=1, description="Maximum number of guests", examples=[4])
-    bedrooms: int = Field(..., ge=0, description="Number of bedrooms", examples=[2])
-    beds: int = Field(..., ge=1, description="Number of beds", examples=[2])
-    baths: float = Field(..., ge=0, description="Number of bathrooms", examples=[1.0])
+    """Request body for `/{city}/predict` — all listing fields **including** price."""
+
+    price: float = Field(
+        ..., gt=0,
+        description="Nightly price in USD that the host intends to charge.",
+        examples=[35.0],
+    )
+    max_guests: int = Field(
+        ..., ge=1,
+        description="Maximum number of guests the listing can accommodate.",
+        examples=[4],
+    )
+    bedrooms: int = Field(
+        ..., ge=0,
+        description="Number of bedrooms (0 for studio).",
+        examples=[2],
+    )
+    beds: int = Field(
+        ..., ge=1,
+        description="Total number of beds.",
+        examples=[2],
+    )
+    baths: float = Field(
+        ..., ge=0,
+        description="Number of bathrooms (0.5 = shared half-bath).",
+        examples=[1.0],
+    )
     listing_type: str = Field(
         default="Entire rental unit",
-        description="Type of listing",
+        description="Airbnb listing type.",
         examples=["Entire rental unit", "Private room", "Entire home"],
     )
     room_type: str = Field(
         default="Entire rental unit",
-        description="Room type",
-        examples=["Entire rental unit", "Private room"],
+        description="Airbnb room type category.",
+        examples=["Entire home/apt", "Private room"],
     )
-    location: Location = Field(..., description="Listing coordinates")
+    location: Location = Field(..., description="GPS coordinates of the listing.")
     amenities: list[str] = Field(
         default=[],
-        description="List of amenity names",
+        description=(
+            "List of amenity names exactly as returned by `GET /{city}/amenities`. "
+            "Unrecognised names are silently ignored."
+        ),
         examples=[["Wifi", "Kitchen", "Air conditioning", "TV", "Free parking on premises"]],
     )
 
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "price": 35.0,
+                    "max_guests": 4,
+                    "bedrooms": 2,
+                    "beds": 2,
+                    "baths": 1.0,
+                    "listing_type": "Entire rental unit",
+                    "room_type": "Entire home/apt",
+                    "location": {"lat": 33.65, "lng": 73.06},
+                    "amenities": [
+                        "Wifi", "Kitchen", "Air conditioning",
+                        "TV", "Free parking on premises", "Hot water",
+                    ],
+                }
+            ]
+        }
+    }
+
 
 class PredictWithPriceResponse(BaseModel):
-    """Response when price is provided — occupancy + derived metrics."""
-    price: float = Field(..., description="The price you provided ($/night)")
-    market_price: float = Field(..., description="Model-predicted market rate ($/night)")
-    occupancy_rate: float = Field(..., description="Predicted occupancy rate (%)")
-    positioning: str = Field(..., description="Price positioning vs market")
-    booked_nights_per_month: float = Field(..., description="Expected booked nights per month")
-    booked_nights_per_year: int = Field(..., description="Expected booked nights per year")
-    monthly_revenue: float = Field(..., description="Expected monthly revenue ($)")
-    annual_revenue: float = Field(..., description="Expected annual revenue ($)")
-    daily_earnings: float = Field(..., description="Average daily earnings ($)")
-    recommendation: str = Field(..., description="Human-readable recommendation")
+    """Revenue analytics for a listing at a host-specified price."""
+
+    price: float           = Field(..., description="The price you provided ($/night).")
+    market_price: float    = Field(..., description="Model-predicted market rate for this listing type and location ($/night).")
+    occupancy_rate: float  = Field(..., description="Predicted occupancy rate at the given price (%).")
+    positioning: str       = Field(..., description=(
+        "Where your price sits relative to the market. "
+        "One of: `at market rate`, `above market rate (premium positioning)`, "
+        "`below market rate (competitive positioning)`."
+    ))
+    booked_nights_per_month: float = Field(..., description="Expected number of booked nights per month.")
+    booked_nights_per_year: int    = Field(..., description="Expected number of booked nights per year.")
+    monthly_revenue: float         = Field(..., description="Expected gross monthly revenue ($/month).")
+    annual_revenue: float          = Field(..., description="Expected gross annual revenue ($/year).")
+    daily_earnings: float          = Field(..., description="Average daily earnings accounting for vacancy ($/day).")
+    recommendation: str            = Field(..., description="Human-readable summary with occupancy, revenue, and neighbourhood context.")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "price": 35.0,
+                    "market_price": 36.23,
+                    "occupancy_rate": 23.5,
+                    "positioning": "at market rate",
+                    "booked_nights_per_month": 7.1,
+                    "booked_nights_per_year": 86,
+                    "monthly_revenue": 248.5,
+                    "annual_revenue": 3010.0,
+                    "daily_earnings": 8.28,
+                    "recommendation": (
+                        "At $35.00/night (at market rate), expect ~24% occupancy "
+                        "(~7 nights/month). Estimated monthly revenue: $249. "
+                        "Comparable listings in your area charge $28–$45/night."
+                    ),
+                }
+            ]
+        }
+    }
 
 
 @app.post(
     "/{city}/predict",
     response_model=PredictWithPriceResponse,
     tags=["Prediction"],
-    summary="Predict occupancy for a given price",
+    summary="Predict occupancy at a given price",
+    response_description="Occupancy rate and full revenue analytics at the provided price.",
+    responses={
+        200: {"description": "Prediction successful."},
+        422: {"description": "Validation error — check request body fields."},
+        500: {"description": "Internal prediction error."},
+        503: {"description": "Models for the requested city are not yet loaded."},
+    },
 )
 def predict_endpoint(
     req: PredictWithPriceRequest,
-    city: CityType = Path(..., description="City (islamabad | lahore | karachi)"),
+    city: CityType = Path(..., description="City whose model to use.", examples=["islamabad"]),
 ):
     """
-    **Price IS provided** — predict occupancy at the given price and return
-    full revenue analytics.
+    **Use this endpoint when the host already has a price in mind.**
 
-    Use this when the host already has a price in mind and wants to know
-    what occupancy rate and revenue to expect.
+    Given a complete listing description including the intended nightly price,
+    the API predicts:
+
+    - **Occupancy rate** — what percentage of nights will be booked at that price
+    - **Revenue metrics** — expected monthly and annual revenue
+    - **Market positioning** — how the price compares to comparable listings nearby
+    - **Recommendation** — plain-English summary
+
+    The occupancy model is trained on city-specific data, so Islamabad, Lahore,
+    and Karachi each produce different predictions reflecting their local markets.
     """
     models = _get_city_models(city)
     try:
@@ -172,73 +336,184 @@ def predict_endpoint(
 # ==============================================================================
 
 class PredictWithoutPriceRequest(BaseModel):
-    """All listing fields EXCEPT price."""
-    max_guests: int = Field(..., ge=1, description="Maximum number of guests", examples=[4])
-    bedrooms: int = Field(..., ge=0, description="Number of bedrooms", examples=[2])
-    beds: int = Field(..., ge=1, description="Number of beds", examples=[2])
-    baths: float = Field(..., ge=0, description="Number of bathrooms", examples=[1.0])
+    """Request body for `/{city}/predict-price` — all listing fields **except** price."""
+
+    max_guests: int = Field(
+        ..., ge=1,
+        description="Maximum number of guests the listing can accommodate.",
+        examples=[4],
+    )
+    bedrooms: int = Field(
+        ..., ge=0,
+        description="Number of bedrooms (0 for studio).",
+        examples=[2],
+    )
+    beds: int = Field(
+        ..., ge=1,
+        description="Total number of beds.",
+        examples=[2],
+    )
+    baths: float = Field(
+        ..., ge=0,
+        description="Number of bathrooms (0.5 = shared half-bath).",
+        examples=[1.0],
+    )
     listing_type: str = Field(
         default="Entire rental unit",
-        description="Type of listing",
+        description="Airbnb listing type.",
         examples=["Entire rental unit", "Private room", "Entire home"],
     )
     room_type: str = Field(
         default="Entire rental unit",
-        description="Room type",
-        examples=["Entire rental unit", "Private room"],
+        description="Airbnb room type category.",
+        examples=["Entire home/apt", "Private room"],
     )
-    location: Location = Field(..., description="Listing coordinates")
+    location: Location = Field(..., description="GPS coordinates of the listing.")
     amenities: list[str] = Field(
         default=[],
-        description="List of amenity names",
+        description=(
+            "List of amenity names exactly as returned by `GET /{city}/amenities`. "
+            "Unrecognised names are silently ignored."
+        ),
         examples=[["Wifi", "Kitchen", "Air conditioning", "TV", "Free parking on premises"]],
     )
 
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "max_guests": 4,
+                    "bedrooms": 2,
+                    "beds": 2,
+                    "baths": 1.0,
+                    "listing_type": "Entire rental unit",
+                    "room_type": "Entire home/apt",
+                    "location": {"lat": 33.65, "lng": 73.06},
+                    "amenities": [
+                        "Wifi", "Kitchen", "Air conditioning",
+                        "TV", "Free parking on premises", "Hot water",
+                    ],
+                }
+            ]
+        }
+    }
+
 
 class MarketPriceAnalysis(BaseModel):
-    market_price: float = Field(..., description="Model-predicted market rate ($/night)")
-    occupancy_at_market_price: float = Field(..., description="Occupancy at market price (%)")
-    booked_nights_per_month: float = Field(..., description="Booked nights/month at market price")
-    monthly_revenue_at_market: float = Field(..., description="Monthly revenue at market price ($)")
+    """Revenue comparison at the raw market price vs the revenue-optimal price."""
+    market_price: float              = Field(..., description="Model-predicted market rate ($/night).")
+    occupancy_at_market_price: float = Field(..., description="Predicted occupancy if priced at market rate (%).")
+    booked_nights_per_month: float   = Field(..., description="Booked nights/month at market rate.")
+    monthly_revenue_at_market: float = Field(..., description="Monthly revenue at market rate ($).")
 
 
 class PredictWithoutPriceResponse(BaseModel):
-    """Response when price is NOT provided — optimal price + occupancy + derived metrics."""
-    optimal_price: float = Field(..., description="Revenue-maximised price ($/night)")
-    market_price: float = Field(..., description="Model-predicted market rate ($/night)")
-    price: float = Field(..., description="Recommended price — same as optimal_price ($/night)")
-    occupancy_rate: float = Field(..., description="Predicted occupancy at optimal price (%)")
-    positioning: str = Field(..., description="Optimal price positioning vs market")
-    booked_nights_per_month: float = Field(..., description="Expected booked nights per month")
-    booked_nights_per_year: int = Field(..., description="Expected booked nights per year")
-    monthly_revenue: float = Field(..., description="Expected monthly revenue ($)")
-    annual_revenue: float = Field(..., description="Expected annual revenue ($)")
-    daily_earnings: float = Field(..., description="Average daily earnings ($)")
-    price_range: PriceRange = Field(..., description="Recommended pricing bracket (±15%)")
-    neighborhood: NeighborhoodStats = Field(..., description="Comparable listing price stats")
-    recommendation: str = Field(..., description="Human-readable recommendation")
-    amenity_count: int = Field(..., description="Number of amenities provided")
-    price_sensitivity: float = Field(..., description="Price sensitivity coefficient (0.5=luxury → 1.2=budget)")
-    occupancy_at_market_price: float = Field(..., description="Occupancy at market price for comparison (%)")
-    market_price_analysis: MarketPriceAnalysis = Field(..., description="Detailed market-price comparison")
+    """
+    Optimal pricing recommendation plus full revenue analytics.
+
+    The `optimal_price` is found by sweeping price points around the market rate
+    and selecting the one that maximises `price × occupancy_rate × 30`
+    (estimated monthly revenue). It accounts for price sensitivity — premium
+    listings are penalised less for pricing above market.
+    """
+
+    optimal_price: float    = Field(..., description="Revenue-maximising price found by the model ($/night).")
+    market_price: float     = Field(..., description="Raw market-rate prediction for this listing type and location ($/night).")
+    price: float            = Field(..., description="Alias for `optimal_price` — the recommended price to set ($/night).")
+    occupancy_rate: float   = Field(..., description="Predicted occupancy rate at the optimal price (%).")
+    positioning: str        = Field(..., description=(
+        "Where the optimal price sits relative to market. "
+        "One of: `at market rate`, `above market rate (premium positioning)`, "
+        "`below market rate (competitive positioning)`."
+    ))
+    booked_nights_per_month: float  = Field(..., description="Expected booked nights per month at the optimal price.")
+    booked_nights_per_year: int     = Field(..., description="Expected booked nights per year at the optimal price.")
+    monthly_revenue: float          = Field(..., description="Expected gross monthly revenue at the optimal price ($).")
+    annual_revenue: float           = Field(..., description="Expected gross annual revenue at the optimal price ($).")
+    daily_earnings: float           = Field(..., description="Average daily earnings accounting for vacancy ($/day).")
+    price_range: PriceRange         = Field(..., description="Suggested pricing window — ±15% around the optimal price.")
+    neighborhood: NeighborhoodStats = Field(..., description="Price distribution of comparable listings within ~1 km.")
+    recommendation: str             = Field(..., description="Human-readable summary with price, occupancy, revenue, and neighbourhood context.")
+    amenity_count: int              = Field(..., description="Number of amenities from the request that the model recognised.")
+    price_sensitivity: float        = Field(..., description=(
+        "How elastic demand is for this listing. "
+        "Range 0.5 (luxury — less sensitive to price) → 1.2 (budget — more sensitive). "
+        "Influences how aggressively the model penalises above-market pricing."
+    ))
+    occupancy_at_market_price: float    = Field(..., description="Predicted occupancy if the listing were priced at the raw market rate — for comparison (%).")
+    market_price_analysis: MarketPriceAnalysis = Field(..., description="Revenue metrics at the raw market price for side-by-side comparison with the optimal price.")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "optimal_price": 36.35,
+                    "market_price": 36.23,
+                    "price": 36.35,
+                    "occupancy_rate": 23.5,
+                    "positioning": "at market rate",
+                    "booked_nights_per_month": 7.1,
+                    "booked_nights_per_year": 86,
+                    "monthly_revenue": 257.89,
+                    "annual_revenue": 3127.1,
+                    "daily_earnings": 8.6,
+                    "price_range": {"low": 30.9, "high": 41.8},
+                    "neighborhood": {
+                        "comparable_count": 12,
+                        "min": 18.0, "q25": 26.5, "median": 34.0,
+                        "q75": 44.0, "max": 72.0, "mean": 35.1,
+                    },
+                    "recommendation": (
+                        "At $36.35/night (at market rate), expect ~24% occupancy "
+                        "(~7 nights/month). Estimated monthly revenue: $258. "
+                        "Comparable listings in your area charge $27–$44/night."
+                    ),
+                    "amenity_count": 6,
+                    "price_sensitivity": 0.87,
+                    "occupancy_at_market_price": 23.4,
+                    "market_price_analysis": {
+                        "market_price": 36.23,
+                        "occupancy_at_market_price": 23.4,
+                        "booked_nights_per_month": 7.0,
+                        "monthly_revenue_at_market": 253.61,
+                    },
+                }
+            ]
+        }
+    }
 
 
 @app.post(
     "/{city}/predict-price",
     response_model=PredictWithoutPriceResponse,
     tags=["Prediction"],
-    summary="Find optimal price and predict occupancy",
+    summary="Find the optimal price and predict occupancy",
+    response_description="Optimal price recommendation, occupancy forecast, and full revenue analytics.",
+    responses={
+        200: {"description": "Prediction successful."},
+        422: {"description": "Validation error — check request body fields."},
+        500: {"description": "Internal prediction error."},
+        503: {"description": "Models for the requested city are not yet loaded."},
+    },
 )
 def predict_price_endpoint(
     req: PredictWithoutPriceRequest,
-    city: CityType = Path(..., description="City (islamabad | lahore | karachi)"),
+    city: CityType = Path(..., description="City whose model to use.", examples=["islamabad"]),
 ):
     """
-    **Price NOT provided** — find the optimal price, predict occupancy at
-    that price, and return full revenue analytics.
+    **Use this endpoint when the host does not yet have a price in mind.**
 
-    Use this when the host wants a data-driven price recommendation
-    and wants to know the expected occupancy and revenue at that price.
+    Given a listing description (without price), the API:
+
+    1. **Predicts the market rate** — what similar listings in the area charge
+    2. **Finds the optimal price** — sweeps price points to maximise estimated monthly revenue
+       (`price × occupancy × 30`), accounting for how price-sensitive this type of listing is
+    3. **Predicts occupancy** at the optimal price using the occupancy model
+    4. **Computes full revenue metrics** — monthly/annual revenue, booked nights, daily earnings
+    5. **Returns a market comparison** — how the optimal price compares to the raw market rate
+
+    The `price_sensitivity` coefficient reflects how aggressively demand drops as price
+    rises above market: `0.5` = luxury (less penalised), `1.2` = budget (more penalised).
     """
     models = _get_city_models(city)
     try:
@@ -262,9 +537,14 @@ def predict_price_endpoint(
 # REFERENCE ENDPOINTS
 # ==============================================================================
 
-@app.get("/", tags=["Health"])
+@app.get(
+    "/",
+    tags=["Health"],
+    summary="Health check",
+    response_description="Service status and list of cities with models currently loaded.",
+)
 def root():
-    """Health check — returns service status and which city models are loaded."""
+    """Returns `ok` plus which city models are currently loaded and serving requests."""
     return {
         "status": "ok",
         "service": "RentSight Combined API",
@@ -273,20 +553,49 @@ def root():
     }
 
 
-@app.get("/cities", tags=["Reference"])
+@app.get(
+    "/cities",
+    tags=["Reference"],
+    summary="List available cities",
+    response_description="Cities with models loaded vs all supported cities.",
+)
 def list_cities():
-    """Return which cities have models loaded and are ready to serve predictions."""
+    """
+    Returns two lists:
+
+    - **`available`** — cities that have models loaded and are ready to serve predictions right now
+    - **`all`** — every city the API supports (models may not be loaded for all of them)
+    """
     return {
         "available": list(all_city_models.keys()),
         "all": ["islamabad", "lahore", "karachi"],
     }
 
 
-@app.get("/{city}/amenities", tags=["Reference"])
+@app.get(
+    "/{city}/amenities",
+    tags=["Reference"],
+    summary="List recognised amenities for a city",
+    response_description="Top individual amenities and grouped amenity categories used as model features.",
+    responses={
+        503: {"description": "Models for the requested city are not yet loaded."},
+    },
+)
 def list_amenities(
-    city: CityType = Path(..., description="City (islamabad | lahore | karachi)"),
+    city: CityType = Path(..., description="City whose amenity list to return.", examples=["islamabad"]),
 ):
-    """Return the amenities the models for this city recognise as features."""
+    """
+    Returns the amenity names that the **city's model** was trained on.
+
+    Use these exact strings in the `amenities` array when calling the prediction
+    endpoints — unrecognised names are silently ignored by the model.
+
+    Response structure:
+
+    - **`top_amenities`** — individual amenities used as binary features (present / not present)
+    - **`categories`** — grouped amenity categories used as count features
+      (e.g. `kitchen`, `comfort`, `safety`, `entertainment`, `convenience`, `outdoor`, `family`)
+    """
     models = _get_city_models(city)
     meta = models['price_meta']
     return {
